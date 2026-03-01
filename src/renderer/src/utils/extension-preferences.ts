@@ -61,6 +61,80 @@ export function getScriptCmdArgsKey(commandId: string): string {
   return `${SCRIPT_CMD_ARGS_KEY_PREFIX}${commandId}`;
 }
 
+export function getDefaultPreferenceValue(def: PreferenceDefinition): any {
+  if (def.default !== undefined) return def.default;
+  if (def.type === 'checkbox') return false;
+  if (def.type === 'dropdown') return def.data?.[0]?.value ?? '';
+  return '';
+}
+
+export function normalizePreferenceValue(def: PreferenceDefinition, value: any): any {
+  const type = String(def.type || 'textfield');
+  if (value === undefined || value === null) return getDefaultPreferenceValue(def);
+
+  if (type === 'checkbox') {
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'string') {
+      const normalized = value.trim().toLowerCase();
+      if (normalized === 'true') return true;
+      if (normalized === 'false') return false;
+    }
+    return getDefaultPreferenceValue(def);
+  }
+
+  if (type === 'dropdown') {
+    const normalized = typeof value === 'string' ? value.trim() : String(value).trim();
+    const options = Array.isArray(def.data)
+      ? def.data
+          .map((option) => {
+            if (!option || typeof option !== 'object') return null;
+            return {
+              value: String((option as any).value ?? '').trim(),
+              title: String((option as any).title ?? '').trim(),
+            };
+          })
+          .filter(Boolean) as Array<{ value: string; title: string }>
+      : [];
+    if (options.length === 0) return normalized;
+
+    const directMatch = options.find((option) => option.value === normalized);
+    if (directMatch) return directMatch.value;
+
+    const titleMatch = options.find((option) => option.title === normalized);
+    if (titleMatch) return titleMatch.value;
+
+    const caseInsensitiveTitleMatch = options.find((option) => option.title.toLowerCase() === normalized.toLowerCase());
+    if (caseInsensitiveTitleMatch) return caseInsensitiveTitleMatch.value;
+
+    return getDefaultPreferenceValue(def);
+  }
+
+  if (type === 'textfield' || type === 'password' || type === 'file' || type === 'directory' || type === 'appPicker') {
+    return typeof value === 'string' ? value : String(value);
+  }
+
+  return value;
+}
+
+export function hydrateStoredPreferenceValues(
+  baseValues: Record<string, any>,
+  defs: PreferenceDefinition[],
+  storedValues: Record<string, any>
+): Record<string, any> {
+  const next = {
+    ...baseValues,
+    ...storedValues,
+  };
+
+  for (const def of defs) {
+    if (!def?.name) continue;
+    if (!Object.prototype.hasOwnProperty.call(storedValues, def.name)) continue;
+    next[def.name] = normalizePreferenceValue(def, storedValues[def.name]);
+  }
+
+  return next;
+}
+
 export function hydrateExtensionBundlePreferences(bundle: ExtensionBundle): ExtensionBundle {
   const extName = bundle.extName || bundle.extensionName || '';
   const cmdName = bundle.cmdName || bundle.commandName || '';
@@ -70,13 +144,18 @@ export function hydrateExtensionBundlePreferences(bundle: ExtensionBundle): Exte
     bundle.mode === 'no-view' && extName && cmdName
       ? readJsonObject(getCmdArgsKey(extName, cmdName))
       : {};
+  const defs = bundle.preferenceDefinitions || [];
+  const extensionDefs = defs.filter((def) => def?.scope !== 'command');
+  const commandDefs = defs.filter((def) => def?.scope === 'command');
+  const normalizedPreferences = hydrateStoredPreferenceValues(
+    hydrateStoredPreferenceValues(bundle.preferences || {}, extensionDefs, extStored),
+    commandDefs,
+    cmdStored
+  );
+
   return {
     ...bundle,
-    preferences: {
-      ...(bundle.preferences || {}),
-      ...extStored,
-      ...cmdStored,
-    },
+    preferences: normalizedPreferences,
     launchArguments: {
       ...(bundle as any).launchArguments,
       ...argStored,
