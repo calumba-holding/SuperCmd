@@ -183,8 +183,15 @@ export function filterCommands(
   aliasLookup: Record<string, string> = {}
 ): CommandInfo[] {
   const normalizedQuery = normalizeSearchText(query);
+
+  // Always-on-top commands (e.g. update banner) are pinned above the list
+  // when there is no active query. With a query they are scored normally and
+  // only shown if they match — but always sorted before other results.
+  const alwaysOnTop = commands.filter((c) => c.alwaysOnTop);
+  const rest = commands.filter((c) => !c.alwaysOnTop);
+
   if (!normalizedQuery) {
-    return commands;
+    return [...alwaysOnTop, ...rest];
   }
 
   const queryTerms = tokenizeSearchText(normalizedQuery);
@@ -259,7 +266,7 @@ export function filterCommands(
     })
     .filter(
       (entry): entry is { cmd: CommandInfo; score: number; title: string; hasExactAliasMatch: boolean } =>
-        Boolean(entry) && entry.score > 0
+        entry !== null && entry.score > 0
     )
     .sort((a, b) => {
       if (a.hasExactAliasMatch !== b.hasExactAliasMatch) {
@@ -269,7 +276,9 @@ export function filterCommands(
       return a.title.localeCompare(b.title);
     });
 
-  return scored.map(({ cmd }) => cmd);
+  const matchedTop = scored.filter(({ cmd }) => cmd.alwaysOnTop).map(({ cmd }) => cmd);
+  const matchedRest = scored.filter(({ cmd }) => !cmd.alwaysOnTop).map(({ cmd }) => cmd);
+  return [...matchedTop, ...matchedRest];
 }
 
 /**
