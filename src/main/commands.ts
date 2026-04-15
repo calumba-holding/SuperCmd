@@ -1556,6 +1556,12 @@ async function discoverAndBuildCommands(): Promise<CommandInfo[]> {
       category: 'system',
     },
     {
+      id: 'system-open-extension-store',
+      title: 'Extension Store',
+      keywords: ['extension', 'store', 'browse', 'install', 'community', 'marketplace', 'supercmd'],
+      category: 'system',
+    },
+    {
       id: 'system-open-onboarding',
       title: 'SuperCmd Onboarding',
       keywords: ['welcome', 'onboarding', 'intro', 'setup', 'supercmd'],
