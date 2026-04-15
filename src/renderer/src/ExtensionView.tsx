@@ -72,6 +72,8 @@ interface ExtensionViewProps {
   launchContext?: Record<string, any>;
   fallbackText?: string | null;
   launchType?: 'userInitiated' | 'background';
+  /** Mirror execution status to the system status-bar badge (for hotkey-triggered silent runs). */
+  reportStatus?: boolean;
 }
 
 function getDefaultExtensionPreferenceValue(def: NonNullable<ExtensionViewProps['preferenceDefinitions']>[number]): any {
@@ -3494,6 +3496,7 @@ const NoViewRunner: React.FC<{
   launchContext?: Record<string, any>;
   fallbackText?: string | null;
   launchType?: 'userInitiated' | 'background';
+  reportStatus?: boolean;
 }> = ({
   fn,
   title,
@@ -3502,6 +3505,7 @@ const NoViewRunner: React.FC<{
   launchContext,
   fallbackText,
   launchType = 'userInitiated',
+  reportStatus = false,
 }) => {
   const [status, setStatus] = useState<'running' | 'done' | 'error'>('running');
   const [errorMsg, setErrorMsg] = useState('');
@@ -3521,6 +3525,13 @@ const NoViewRunner: React.FC<{
 
     (async () => {
       try {
+        // Enable badge bridging so showHUD / showToast calls from the extension
+        // are mirrored to the system status badge. No automatic "Running…" or
+        // "Done" messages are shown — the extension owns its own status.
+        if (reportStatus) {
+          (window as any).__scNoViewStatusTracking = true;
+          (window as any).__scNoViewStatusReported = false;
+        }
         await fn({
           arguments: launchArguments,
           launchType,
@@ -3528,11 +3539,19 @@ const NoViewRunner: React.FC<{
           fallbackText,
         });
         if (!cancelled) {
+          if (reportStatus) {
+            (window as any).__scNoViewStatusTracking = false;
+            (window as any).__scNoViewStatusReported = false;
+          }
           setStatus('done');
           closeTimerRef.current = window.setTimeout(() => onCloseRef.current(), 600);
         }
       } catch (e: any) {
         if (!cancelled) {
+          if (reportStatus) {
+            (window as any).__scNoViewStatusTracking = false;
+            (window as any).__scNoViewStatusReported = false;
+          }
           setStatus('error');
           setErrorMsg(e?.message || 'Command failed');
         }
@@ -3633,6 +3652,7 @@ const ExtensionView: React.FC<ExtensionViewProps> = ({
   launchContext,
   fallbackText,
   launchType = 'userInitiated',
+  reportStatus = false,
 }) => {
   const [error, setError] = useState<string | null>(buildError || null);
   const [navStack, setNavStack] = useState<React.ReactElement[]>([]);
@@ -3779,6 +3799,7 @@ const ExtensionView: React.FC<ExtensionViewProps> = ({
             launchContext={launchContext}
             fallbackText={fallbackText}
             launchType={launchType}
+            reportStatus={reportStatus}
           />
         </ScopedExtensionContext>
       </div>

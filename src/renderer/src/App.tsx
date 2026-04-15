@@ -59,6 +59,7 @@ import {
   clearCommandArguments,
   hydrateExtensionBundlePreferences,
   shouldOpenCommandSetup,
+  getMissingRequiredPreferences,
   getMissingRequiredScriptArguments, toScriptArgumentMapFromArray,
 } from './utils/extension-preferences';
 import { applyAppFontSize, getDefaultAppFontSize } from './utils/font-size';
@@ -413,10 +414,11 @@ const App: React.FC = () => {
 
   const queueNoViewBundleRun = useCallback((
     bundle: ExtensionBundle,
-    launchType: 'userInitiated' | 'background' = 'userInitiated'
+    launchType: 'userInitiated' | 'background' = 'userInitiated',
+    reportStatus = false
   ) => {
     const runId = `${bundle.extensionName || bundle.extName}/${bundle.commandName || bundle.cmdName}/${Date.now()}`;
-    setBackgroundNoViewRuns((prev) => [...prev, { runId, bundle, launchType }]);
+    setBackgroundNoViewRuns((prev) => [...prev, { runId, bundle, launchType, reportStatus }]);
   }, [setBackgroundNoViewRuns]);
 
   const onExitAiMode = useCallback(() => {
@@ -455,6 +457,11 @@ const App: React.FC = () => {
   const quickLinkDynamicInputRef = useRef<HTMLInputElement>(null);
   const windowPresetCommandQueueRef = useRef<Promise<void>>(Promise.resolve());
   const lastWindowHiddenAtRef = useRef<number>(0);
+  // Holds a search query to restore after the window-shown reset, set by the
+  // hotkey no-view path when it needs to open the launcher with a pre-typed query.
+  const pendingWindowShownQueryRef = useRef<string | null>(null);
+  // When true, focus the first inline argument input as soon as it appears.
+  const pendingFocusInlineArgRef = useRef(false);
   const calcRequestSeqRef = useRef(0);
   const isLauncherModeActiveRef = useRef(false);
   const pinnedCommandsRef = useRef<string[]>([]);
@@ -826,7 +833,12 @@ const App: React.FC = () => {
 
       // If an extension is open, keep it alive — don't reset
       if (extensionViewRef.current && !shouldResetOverlays) return;
-      setSearchQuery('');
+      const pendingQuery = pendingWindowShownQueryRef.current;
+      pendingWindowShownQueryRef.current = null;
+      if (pendingQuery) {
+        pendingFocusInlineArgRef.current = true;
+      }
+      setSearchQuery(pendingQuery ?? '');
       setSelectedIndex(0);
       exitAiMode();
       setShowClipboardManager(false);
@@ -930,6 +942,29 @@ const App: React.FC = () => {
       // Hidden menu-bar runners should not hijack the launcher by forcing
       // view commands into the foreground (e.g. pomodoro auto transitions).
       if (sourceMode === 'menu-bar' && hydrated.mode === 'view') {
+        return;
+      }
+
+      // Hotkey-triggered no-view commands: run silently without showing the launcher.
+      // If the command has argument definitions, ALWAYS open the launcher with the
+      // command name pre-typed so the user can review/fill args before running.
+      // Only run silently when the command has no arguments (and prefs are all filled).
+      if (sourceMode === 'hotkey' && hydrated.mode === 'no-view') {
+        const hasRequiredArgDefs = (hydrated.commandArgumentDefinitions || []).some(d => !!d.required);
+        const hasMissingPrefs = getMissingRequiredPreferences(hydrated).length > 0;
+        if (hasRequiredArgDefs || hasMissingPrefs) {
+          const cmdTitle = hydrated.title || hydrated.commandName || hydrated.cmdName || '';
+          pendingWindowShownQueryRef.current = cmdTitle;
+          void window.electron.showWindow();
+          setShowFileSearch(false);
+          setExtensionPreferenceSetup(null);
+        } else {
+          // No-view hotkey commands never call showWindow(), so SuperCmd never
+          // takes focus — the user's active app keeps focus throughout.
+          // activateLastFrontmostApp() is intentionally NOT called here: it
+          // uses stale lastFrontmostApp data and can activate the wrong app.
+          queueNoViewBundleRun(hydrated, 'userInitiated', true);
+        }
         return;
       }
 
@@ -1601,6 +1636,17 @@ const App: React.FC = () => {
       selectedInlineQuickLinkDynamicFields.length
     );
   }, [selectedInlineQuickLinkDynamicFields.length]);
+
+  // When a hotkey-triggered no-view command opens the launcher with a pre-typed
+  // query, focus the first inline argument input once it appears in the DOM.
+  useEffect(() => {
+    if (!pendingFocusInlineArgRef.current) return;
+    if (!isShowingInlineArgumentInputs) return;
+    pendingFocusInlineArgRef.current = false;
+    requestAnimationFrame(() => {
+      inlineArgumentInputRefs.current[0]?.focus();
+    });
+  }, [isShowingInlineArgumentInputs]);
 
   useEffect(() => {
     if (!isLauncherModeActive) return;
@@ -2892,6 +2938,7 @@ const App: React.FC = () => {
           launchContext={(run.bundle as any).launchContext}
           fallbackText={(run.bundle as any).fallbackText}
           launchType={run.launchType}
+          reportStatus={run.reportStatus}
           onClose={() => {
             setBackgroundNoViewRuns((prev) => prev.filter((item) => item.runId !== run.runId));
           }}
