@@ -107,7 +107,8 @@
         "fr": "French",
         "de": "German",
         "es": "Spanish",
-        "ru": "Russian"
+        "ru": "Russian",
+        "it": "Italian"
       },
       "fontSize": {
         "title": "Font Size",
@@ -499,7 +500,10 @@
       "search": {
         "placeholder": "Search...",
         "all": "All",
-        "commands": "Commands"
+        "commands": "Commands",
+        "statusAll": "All",
+        "enabled": "Enabled",
+        "disabled": "Disabled"
       },
       "install": {
         "button": "Install Extension",
@@ -531,7 +535,8 @@
         "extension": "Extension",
         "application": "Application",
         "command": "Command",
-        "menuBarCommand": "Menu Bar Command"
+        "menuBarCommand": "Menu Bar Command",
+        "quickLink": "Quick Link"
       },
       "alias": {
         "add": "Add Alias",
@@ -577,6 +582,19 @@
     "advanced": {
       "title": "Advanced",
       "loading": "Loading advanced settings...",
+      "clipboardRetention": {
+        "title": "Clipboard History Retention",
+        "description": "Auto-delete clipboard entries older than the selected duration. Pinned entries are always kept.",
+        "option": {
+          "1day": "1 day",
+          "7days": "7 days",
+          "1month": "1 month",
+          "3months": "3 months",
+          "6months": "6 months",
+          "1year": "1 year",
+          "never": "Never"
+        }
+      },
       "debugMode": {
         "title": "Debug Mode",
         "description": "Show detailed logs when extensions fail to load or build.",

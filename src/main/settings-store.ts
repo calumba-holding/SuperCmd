@@ -69,7 +69,8 @@ export type AppLanguage =
   | 'fr'
   | 'de'
   | 'es'
-  | 'ru';
+  | 'ru'
+  | 'it';
 
 export interface AppSettings {
   globalShortcut: string;
@@ -103,6 +104,8 @@ export interface AppSettings {
   hyperKey: HyperKeySettings;
   launcherViewMode: LauncherViewMode;
   navigationStyle: AppNavigationStyle;
+  // Auto-prune clipboard items older than N days. `null` = never prune.
+  clipboardHistoryRetentionDays: number | null;
 }
 
 const DEFAULT_HYPER_KEY_SETTINGS: HyperKeySettings = {
@@ -190,6 +193,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   hyperKey: { ...DEFAULT_HYPER_KEY_SETTINGS },
   launcherViewMode: 'expanded',
   navigationStyle: 'vim',
+  clipboardHistoryRetentionDays: null,
 };
 
 let settingsCache: AppSettings | null = null;
@@ -222,6 +226,18 @@ function normalizeNavigationStyle(value: any): AppNavigationStyle {
   return 'vim';
 }
 
+const ALLOWED_CLIPBOARD_RETENTION_DAYS = new Set([1, 7, 30, 90, 180, 365]);
+
+function normalizeClipboardHistoryRetentionDays(value: any): number | null {
+  if (value === null) return null;
+  if (value === undefined) return DEFAULT_SETTINGS.clipboardHistoryRetentionDays;
+  const num = Number(value);
+  if (!Number.isFinite(num)) return DEFAULT_SETTINGS.clipboardHistoryRetentionDays;
+  const int = Math.trunc(num);
+  if (ALLOWED_CLIPBOARD_RETENTION_DAYS.has(int)) return int;
+  return DEFAULT_SETTINGS.clipboardHistoryRetentionDays;
+}
+
 function normalizeAppLanguage(value: any): AppLanguage {
   const normalized = String(value || '').trim().toLowerCase().replace(/_/g, '-');
   if (!normalized || normalized === 'system' || normalized === 'auto') return 'system';
@@ -250,6 +266,7 @@ function normalizeAppLanguage(value: any): AppLanguage {
   if (normalized === 'de' || normalized.startsWith('de-')) return 'de';
   if (normalized === 'es' || normalized.startsWith('es-')) return 'es';
   if (normalized === 'ru' || normalized.startsWith('ru-')) return 'ru';
+  if (normalized === 'it' || normalized.startsWith('it-')) return 'it';
   return DEFAULT_SETTINGS.appLanguage;
 }
 
@@ -394,6 +411,7 @@ export function loadSettings(): AppSettings {
         : DEFAULT_SETTINGS.appUpdaterLastCheckedAt,
       launcherViewMode: (parsed.launcherViewMode === 'compact' ? 'compact' : 'expanded'),
       navigationStyle: normalizeNavigationStyle(parsed.navigationStyle),
+      clipboardHistoryRetentionDays: normalizeClipboardHistoryRetentionDays(parsed.clipboardHistoryRetentionDays),
     };
   } catch {
     settingsCache = { ...DEFAULT_SETTINGS };
@@ -422,6 +440,11 @@ export function saveSettings(patch: Partial<AppSettings>): AppSettings {
     launcherBackgroundImageOpacityPercent: normalizePercentage(
       patch.launcherBackgroundImageOpacityPercent ?? current.launcherBackgroundImageOpacityPercent,
       current.launcherBackgroundImageOpacityPercent
+    ),
+    clipboardHistoryRetentionDays: normalizeClipboardHistoryRetentionDays(
+      'clipboardHistoryRetentionDays' in patch
+        ? patch.clipboardHistoryRetentionDays
+        : current.clipboardHistoryRetentionDays
     ),
   };
 
