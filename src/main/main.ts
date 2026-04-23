@@ -8512,9 +8512,9 @@ function getEmojiPickerWindowHtml(): string {
       user-select: none; pointer-events: none; color: rgba(255,255,255,0.92);
     }
     #card {
-      display: inline-flex; align-items: center; gap: 1px;
-      padding: 3px 4px;
-      border-radius: 9px;
+      display: inline-flex; align-items: center; gap: 2px;
+      padding: 5px 6px;
+      border-radius: 12px;
       background: rgba(18,18,20,0.86);
       border: 1px solid rgba(255,255,255,0.10);
       box-shadow: 0 6px 22px rgba(0,0,0,0.38);
@@ -8523,9 +8523,9 @@ function getEmojiPickerWindowHtml(): string {
     }
     .item {
       display: flex; align-items: center; justify-content: center;
-      width: 26px; height: 26px;
-      border-radius: 6px;
-      font-size: 18px; line-height: 1;
+      width: 36px; height: 36px;
+      border-radius: 8px;
+      font-size: 26px; line-height: 1;
       transition: background 60ms ease, transform 60ms ease;
     }
     .item.sel { background: rgba(86, 140, 255, 0.95); transform: scale(1.06); }
@@ -8552,8 +8552,8 @@ function getEmojiPickerWindowHtml(): string {
 async function ensureEmojiPickerWindow(): Promise<InstanceType<typeof BrowserWindow> | null> {
   if (emojiPickerWindow && !emojiPickerWindow.isDestroyed()) return emojiPickerWindow;
   emojiPickerWindow = new BrowserWindow({
-    width: 260,
-    height: 34,
+    width: 340,
+    height: 48,
     // Explicit x/y so the window does NOT default to screen-center; we'll
     // setBounds to the real position before showing.
     x: 0,
