@@ -2548,6 +2548,8 @@ let emojiPickerSelectedIdx = 0;
 let nativeSpeechProcess: any = null;
 let nativeSpeechStdoutBuffer = '';
 let nativeColorPickerPromise: Promise<any> | null = null;
+let keyboardLockProcess: any = null;
+let keyboardLockReleaseResolvers: Array<() => void> = [];
 let whisperHoldWatcherProcess: any = null;
 let whisperHoldWatcherStdoutBuffer = '';
 let whisperHoldRequestSeq = 0;
@@ -11958,6 +11960,48 @@ app.whenReady().then(async () => {
   // Warm the worker so the first window-management action does not race spawn.
   setTimeout(() => { ensureWindowManagerWorker(); }, 0);
 
+  // Some external image hosts (e.g. libgen.bz, libgen.li, libgen.is) only
+  // serve covers when a Referer header is present — without one they return
+  // 200 OK with a zero-byte body, which the browser displays as a broken
+  // image. Electron pages loaded over file:// strip the Referer header by
+  // default, so cover thumbnails in extensions like `library-genesis` come
+  // out broken. Inject a same-origin Referer for any request that arrives
+  // without one. Only fires when no Referer was set by the renderer, so we
+  // never override an explicit value the caller chose.
+  try {
+    const { session: electronSession } = require('electron');
+    const defaultSession = electronSession?.defaultSession;
+    if (defaultSession?.webRequest?.onBeforeSendHeaders) {
+      let loggedRefererInjection = false;
+      defaultSession.webRequest.onBeforeSendHeaders(
+        { urls: ['http://*/*', 'https://*/*'] },
+        (details: any, callback: any) => {
+          const headers = { ...(details.requestHeaders || {}) };
+          const hasReferer = Boolean(headers['Referer'] || headers['referer']);
+          if (!hasReferer) {
+            try {
+              const parsed = new URL(details.url);
+              const refererValue = `${parsed.protocol}//${parsed.host}/`;
+              headers['Referer'] = refererValue;
+              if (!loggedRefererInjection) {
+                loggedRefererInjection = true;
+                console.log(
+                  `[webRequest] Injecting Referer fallback (first hit): ${refererValue} for ${details.url}`
+                );
+              }
+            } catch {}
+          }
+          callback({ requestHeaders: headers });
+        }
+      );
+      console.log('[webRequest] Referer fallback hook installed on defaultSession');
+    } else {
+      console.warn('[webRequest] defaultSession.webRequest.onBeforeSendHeaders unavailable');
+    }
+  } catch (error) {
+    console.warn('[main] Failed to install Referer fallback webRequest hook:', error);
+  }
+
   // Register the sc-asset:// protocol handler to serve extension asset files
   protocol.handle('sc-asset', (request: any) => {
     // URL format: sc-asset://ext-asset/path/to/file
@@ -15826,6 +15870,191 @@ if let tiff = image?.tiffRepresentation {
       return await nativeColorPickerPromise;
     } finally {
       nativeColorPickerPromise = null;
+    }
+  });
+
+  // ─── IPC: Native Keyboard Lock (clean-keyboard extension bridge) ─
+
+  ipcMain.handle('keyboard-lock:start', async (_event: any, durationSec: number) => {
+    const fsNative = require('fs');
+    const { spawn, execFileSync } = require('child_process');
+    const binaryPath = getNativeBinaryPath('keyboard-lock');
+
+    // Build on demand in development when binary artifacts are missing.
+    if (!fsNative.existsSync(binaryPath)) {
+      try {
+        const sourceCandidates = [
+          path.join(app.getAppPath(), 'src', 'native', 'keyboard-lock.swift'),
+          path.join(process.cwd(), 'src', 'native', 'keyboard-lock.swift'),
+          path.join(__dirname, '..', '..', 'src', 'native', 'keyboard-lock.swift'),
+        ];
+        const sourcePath = sourceCandidates.find((candidate: string) => fsNative.existsSync(candidate));
+        if (!sourcePath) {
+          return { ok: false, error: 'keyboard-lock binary and source file not found' };
+        }
+        fsNative.mkdirSync(path.dirname(binaryPath), { recursive: true });
+        execFileSync('swiftc', ['-O', '-o', binaryPath, sourcePath, '-framework', 'CoreGraphics', '-framework', 'Foundation']);
+      } catch (error: any) {
+        console.error('[KeyboardLock] Failed to compile native helper:', error);
+        return { ok: false, error: String(error?.message || error) };
+      }
+    }
+
+    // If a previous lock is still running, stop it first.
+    if (keyboardLockProcess) {
+      try { keyboardLockProcess.stdin?.write('stop\n'); } catch {}
+      try { keyboardLockProcess.kill('SIGTERM'); } catch {}
+      keyboardLockProcess = null;
+    }
+
+    const safeDuration = Number.isFinite(durationSec) && durationSec > 0
+      ? Math.min(3600, Math.round(durationSec))
+      : 15;
+
+    return await new Promise<{ ok: boolean; error?: string }>((resolve) => {
+      let settled = false;
+      const child = spawn(binaryPath, [String(safeDuration)], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      keyboardLockProcess = child;
+
+      let stdoutBuffer = '';
+      let stderrBuffer = '';
+
+      child.stdout?.on('data', (chunk: Buffer) => {
+        stdoutBuffer += chunk.toString('utf8');
+        if (!settled && stdoutBuffer.includes('ready')) {
+          settled = true;
+          resolve({ ok: true });
+        }
+      });
+
+      child.stderr?.on('data', (chunk: Buffer) => {
+        stderrBuffer += chunk.toString('utf8');
+      });
+
+      child.on('exit', (code: number | null) => {
+        if (keyboardLockProcess === child) {
+          keyboardLockProcess = null;
+        }
+        // Wake any pending stop() callers.
+        const resolvers = keyboardLockReleaseResolvers.slice();
+        keyboardLockReleaseResolvers = [];
+        for (const fn of resolvers) {
+          try { fn(); } catch {}
+        }
+        if (!settled) {
+          settled = true;
+          const message = stderrBuffer.trim() || `keyboard-lock exited with code ${code}`;
+          resolve({ ok: false, error: message });
+        }
+      });
+
+      child.on('error', (error: Error) => {
+        if (!settled) {
+          settled = true;
+          resolve({ ok: false, error: error.message });
+        }
+      });
+    });
+  });
+
+  ipcMain.handle('keyboard-lock:stop', async () => {
+    const child = keyboardLockProcess;
+    if (!child) return { ok: true };
+
+    return await new Promise<{ ok: boolean }>((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        resolve({ ok: true });
+      };
+
+      keyboardLockReleaseResolvers.push(finish);
+
+      try {
+        child.stdin?.write('stop\n');
+      } catch {
+        // stdin may already be closed; SIGTERM as fallback below
+      }
+
+      // Belt-and-suspenders: if the child doesn't exit promptly, force it.
+      setTimeout(() => {
+        if (settled) return;
+        try { child.kill('SIGTERM'); } catch {}
+      }, 250);
+      setTimeout(() => {
+        if (settled) return;
+        try { child.kill('SIGKILL'); } catch {}
+        finish();
+      }, 1500);
+    });
+  });
+
+  // ─── IPC: Native Screen OCR (screenocr extension bridge) ─────────
+
+  ipcMain.handle('screen-ocr:run', async (_event: any, mode: 'recognize' | 'barcode', options: any) => {
+    const fsNative = require('fs');
+    const { execFile, execFileSync } = require('child_process');
+    const binaryPath = getNativeBinaryPath('screen-ocr');
+
+    if (!fsNative.existsSync(binaryPath)) {
+      try {
+        const sourceCandidates = [
+          path.join(app.getAppPath(), 'src', 'native', 'screen-ocr.swift'),
+          path.join(process.cwd(), 'src', 'native', 'screen-ocr.swift'),
+          path.join(__dirname, '..', '..', 'src', 'native', 'screen-ocr.swift'),
+        ];
+        const sourcePath = sourceCandidates.find((candidate: string) => fsNative.existsSync(candidate));
+        if (!sourcePath) {
+          return { ok: false, error: 'screen-ocr binary and source file not found' };
+        }
+        fsNative.mkdirSync(path.dirname(binaryPath), { recursive: true });
+        execFileSync('swiftc', [
+          '-O', '-o', binaryPath, sourcePath,
+          '-framework', 'AppKit',
+          '-framework', 'CoreGraphics',
+          '-framework', 'Foundation',
+          '-framework', 'Vision',
+        ]);
+      } catch (error: any) {
+        console.error('[ScreenOCR] Failed to compile native helper:', error);
+        return { ok: false, error: String(error?.message || error) };
+      }
+    }
+
+    if (mode !== 'recognize' && mode !== 'barcode') {
+      return { ok: false, error: `unknown mode '${mode}'` };
+    }
+
+    const optionsJson = JSON.stringify(options || {});
+
+    // Keep the launcher hidden while screencapture's interactive selection is up.
+    suppressBlurHide = true;
+    try {
+      return await new Promise<{ ok: boolean; text?: string; error?: string }>((resolve) => {
+        // Use a generous buffer — recognized OCR text can be large.
+        execFile(binaryPath, [mode, optionsJson], { maxBuffer: 8 * 1024 * 1024 }, (error: any, stdout: string, stderr: string) => {
+          if (error) {
+            resolve({ ok: false, error: stderr?.trim() || error.message });
+            return;
+          }
+          const trimmed = String(stdout || '').trim();
+          if (!trimmed) {
+            resolve({ ok: false, error: 'screen-ocr returned empty output' });
+            return;
+          }
+          try {
+            const parsed = JSON.parse(trimmed);
+            resolve(parsed);
+          } catch (e: any) {
+            resolve({ ok: false, error: `failed to parse screen-ocr output: ${e?.message || e}` });
+          }
+        });
+      });
+    } finally {
+      suppressBlurHide = false;
     }
   });
 

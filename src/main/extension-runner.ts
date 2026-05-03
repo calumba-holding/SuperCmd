@@ -702,11 +702,11 @@ export async function buildAllCommands(extName: string, extPathOverride?: string
           platform: 'node',
           outfile: outFile,
           plugins: [
-            // Mark swift: imports as external so fakeRequire can handle them at runtime
+            // Mark swift:/rust: imports as external so fakeRequire can handle them at runtime
             {
-              name: 'swift-external',
+              name: 'native-scheme-external',
               setup(build: any) {
-                build.onResolve({ filter: /^swift:/ }, (args: any) => ({
+                build.onResolve({ filter: /^(swift|rust):/ }, (args: any) => ({
                   path: args.path,
                   external: true,
                 }));
@@ -995,9 +995,9 @@ export async function buildSingleCommand(extName: string, cmdName: string): Prom
         outfile: outFile,
         plugins: [
           {
-            name: 'swift-external',
+            name: 'native-scheme-external',
             setup(build: any) {
-              build.onResolve({ filter: /^swift:/ }, (args: any) => ({
+              build.onResolve({ filter: /^(swift|rust):/ }, (args: any) => ({
                 path: args.path,
                 external: true,
               }));
@@ -1134,6 +1134,42 @@ export async function getExtensionBundle(
         await buildAllCommands(normalizedExtName);
       } catch (rebuildError) {
         console.warn(`Full rebuild fallback failed for ${normalizedExtName}:`, rebuildError);
+      }
+    }
+
+    // Detect "incomplete bundle" scenario: an S3 pre-built bundle dropped
+    // .sc-build/ on disk for some commands but didn't ship the matching
+    // source files for others. resolveEntryFile() returns null, the build
+    // can never produce outFile, and the user is stuck. Re-run the install
+    // from the source-download path (skipBundle: true) and retry the build.
+    if (!fs.existsSync(outFile)) {
+      let entryMissing = false;
+      try {
+        const pkgPath = path.join(extPath, 'package.json');
+        const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+        const cmd = (Array.isArray(pkg?.commands) ? pkg.commands : []).find((c: any) => c?.name === cmdName);
+        if (cmd && !resolveEntryFile(extPath, cmd)) entryMissing = true;
+      } catch {}
+
+      if (entryMissing) {
+        console.log(`Source missing for ${normalizedExtName}/${cmdName}; re-installing from source to recover…`);
+        try {
+          const { installExtension } = require('./extension-registry');
+          const reinstalled = await installExtension(normalizedExtName, { skipBundle: true });
+          if (reinstalled) {
+            // Retry building now that source should be present.
+            const rebuilt = await buildSingleCommand(normalizedExtName, cmdName);
+            if (!rebuilt || !fs.existsSync(outFile)) {
+              try {
+                await buildAllCommands(normalizedExtName);
+              } catch (e) {
+                console.warn(`Post-recovery full rebuild failed for ${normalizedExtName}:`, e);
+              }
+            }
+          }
+        } catch (recoveryError) {
+          console.warn(`Source-reinstall recovery failed for ${normalizedExtName}:`, recoveryError);
+        }
       }
     }
 

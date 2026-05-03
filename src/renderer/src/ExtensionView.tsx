@@ -3074,6 +3074,63 @@ const {
   };
 })();
 
+/**
+ * Patch Node's `Readable.fromWeb` (and the corresponding helper on
+ * `node:stream/promises` if present) to accept cross-realm ReadableStreams.
+ *
+ * In the renderer, `globalThis.ReadableStream` is the Blink-realm class; the
+ * `ReadableStream` exported from Node's `stream/web` is a different class with
+ * the same name. Extensions that do `Readable.fromWeb(fetchResponse.body)`
+ * fail Node's internal `stream instanceof ReadableStream` check — the
+ * confusing "must be an instance of ReadableStream. Received an instance of
+ * ReadableStream" error. We re-wrap foreign-realm streams in a Node-realm
+ * ReadableStream before delegating, by pumping the foreign `getReader()` into
+ * a fresh Node ReadableStream, which is what fromWeb actually wants.
+ */
+function patchReadableFromWebOnce(mod: any, getNodeReadableStream: () => any): void {
+  if (!mod || !mod.Readable || mod.Readable.__scFromWebPatched) return;
+  const Readable = mod.Readable;
+  const original = Readable.fromWeb;
+  if (typeof original !== 'function') return;
+
+  Readable.fromWeb = function patchedFromWeb(stream: any, options?: any) {
+    try {
+      return original.call(this, stream, options);
+    } catch (err: any) {
+      const NodeReadableStream = getNodeReadableStream();
+      if (!NodeReadableStream || !stream || typeof stream.getReader !== 'function') {
+        throw err;
+      }
+      const reader = stream.getReader();
+      const wrapped = new NodeReadableStream({
+        async pull(controller: any) {
+          try {
+            const { done, value } = await reader.read();
+            if (done) controller.close();
+            else controller.enqueue(value);
+          } catch (pumpErr: any) {
+            controller.error(pumpErr);
+          }
+        },
+        cancel(reason: any) {
+          try { reader.cancel(reason); } catch {}
+        },
+      });
+      return original.call(this, wrapped, options);
+    }
+  };
+  Readable.__scFromWebPatched = true;
+}
+
+function isStreamRequest(name: string): boolean {
+  return (
+    name === 'stream' ||
+    name === 'node:stream' ||
+    name === 'stream/promises' ||
+    name === 'node:stream/promises'
+  );
+}
+
 function tryRealNodeRequire(name: string): any | undefined {
   if (!USE_REAL_NODE_BUILTINS) return undefined;
   if (!isNodeBuiltinRequest(name)) return undefined;
@@ -3089,7 +3146,17 @@ function tryRealNodeRequire(name: string): any | undefined {
   const realRequire = _realNodeRequire || bridgeRequire;
   if (!realRequire) return undefined;
   try {
-    return realRequire(name);
+    const mod = realRequire(name);
+    if (isStreamRequest(name) && mod) {
+      patchReadableFromWebOnce(mod, () => {
+        try {
+          return realRequire('node:stream/web')?.ReadableStream;
+        } catch {
+          try { return realRequire('stream/web')?.ReadableStream; } catch { return undefined; }
+        }
+      });
+    }
+    return mod;
   } catch (e) {
     // Fall through to the stub path — don't let a missing-in-Node import
     // break the extension. Log once at debug level.
@@ -3296,6 +3363,204 @@ function ensureGlobals() {
 }
 
 /**
+ * Per-ExtensionView registry of timer handles created by the extension's
+ * sandboxed setInterval/setTimeout/requestAnimationFrame. Cleared on unmount
+ * so a buggy extension (e.g. raycast/timers) cannot leak timers + retained
+ * fibers into the host renderer.
+ */
+export interface TimerRegistry {
+  intervals: Set<number>;
+  timeouts: Set<number>;
+  rafs: Set<number>;
+}
+
+export function createTimerRegistry(): TimerRegistry {
+  return { intervals: new Set(), timeouts: new Set(), rafs: new Set() };
+}
+
+export function clearTimerRegistry(registry: TimerRegistry): void {
+  registry.intervals.forEach((id) => window.clearInterval(id));
+  registry.timeouts.forEach((id) => window.clearTimeout(id));
+  registry.rafs.forEach((id) => window.cancelAnimationFrame(id));
+  registry.intervals.clear();
+  registry.timeouts.clear();
+  registry.rafs.clear();
+}
+
+/**
+ * JS shim for the `swift:AppleReminders` native module that the
+ * raycast/apple-reminders extension imports. Backs operations with
+ * AppleScript through our existing runAppleScript IPC, so users can
+ * create / list / toggle reminders without a compiled Swift binary.
+ *
+ * Only the operations the extension actually calls are implemented end-to-end;
+ * the rest are no-ops returning empty/optimistic results so the extension's
+ * UI doesn't crash on missing exports.
+ */
+function createAppleRemindersBridge(): Record<string, any> {
+  const electron = (window as any).electron;
+  const escapeAS = (s: any) =>
+    String(s ?? '').replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  const runScript = async (script: string): Promise<string> => {
+    if (!electron?.runAppleScript) throw new Error('AppleScript bridge unavailable');
+    return String((await electron.runAppleScript(script)) || '');
+  };
+
+  const splitTabbedLines = (raw: string) =>
+    raw
+      .split('\n')
+      .map((line) => line.replace(/\r$/, ''))
+      .filter((line) => line.length > 0);
+
+  return {
+    // Account / permission probe — Reminders.app is reachable iff we got past
+    // System Events permission. Treat any non-error response as "granted".
+    requestAccess: async () => true,
+    hasAccess: async () => true,
+
+    getAccounts: async () => [{ id: 'default', name: 'iCloud' }],
+
+    getLists: async () => {
+      const script = `
+tell application "Reminders"
+  set output to ""
+  repeat with l in lists
+    set output to output & (id of l) & "\\t" & (name of l) & "\\n"
+  end repeat
+  return output
+end tell`.trim();
+      try {
+        const raw = await runScript(script);
+        return splitTabbedLines(raw).map((line) => {
+          const [id, title] = line.split('\t');
+          return { id, title, name: title };
+        });
+      } catch (err) {
+        console.error('[AppleReminders.getLists]', err);
+        return [];
+      }
+    },
+
+    getReminders: async (_opts?: { listId?: string }) => {
+      const listClause = _opts?.listId
+        ? `tell (first list whose id is "${escapeAS(_opts.listId)}")`
+        : `tell application "Reminders"`;
+      const script = `
+${listClause}
+  set output to ""
+  repeat with r in reminders
+    set rid to id of r
+    set rname to name of r
+    set rdone to completed of r
+    set output to output & rid & "\\t" & rname & "\\t" & (rdone as text) & "\\n"
+  end repeat
+  return output
+end tell`.trim();
+      try {
+        const raw = await runScript(script);
+        return splitTabbedLines(raw).map((line) => {
+          const [id, title, done] = line.split('\t');
+          return { id, title, isCompleted: done === 'true', completed: done === 'true' };
+        });
+      } catch (err) {
+        console.error('[AppleReminders.getReminders]', err);
+        return [];
+      }
+    },
+
+    createReminder: async (opts: any) => {
+      const title = opts?.title ?? opts?.name ?? 'New Reminder';
+      const notes = opts?.notes ?? opts?.body ?? '';
+      const listId = opts?.listId || opts?.list?.id || '';
+      const dueDateRaw = opts?.dueDate || opts?.date;
+
+      const props: string[] = [`name:"${escapeAS(title)}"`];
+      if (notes) props.push(`body:"${escapeAS(notes)}"`);
+
+      const targetList = listId
+        ? `set targetList to first list whose id is "${escapeAS(listId)}"`
+        : `set targetList to default list`;
+
+      // Optional due date — use AppleScript's "current date" + offset to avoid
+      // locale-dependent date string parsing. Caller passes ISO; we compute
+      // the delta in seconds at call time.
+      let dueClause = '';
+      if (dueDateRaw) {
+        const due = new Date(dueDateRaw);
+        if (!Number.isNaN(due.getTime())) {
+          const deltaSeconds = Math.round((due.getTime() - Date.now()) / 1000);
+          dueClause = `\n  set due date of newReminder to (current date) + (${deltaSeconds})`;
+        }
+      }
+
+      const script = `
+tell application "Reminders"
+  ${targetList}
+  set newReminder to make new reminder at end of reminders of targetList with properties {${props.join(', ')}}${dueClause}
+  return id of newReminder
+end tell`.trim();
+
+      try {
+        const id = (await runScript(script)).trim();
+        return { id, title, notes, isCompleted: false };
+      } catch (err: any) {
+        console.error('[AppleReminders.createReminder]', err);
+        throw new Error(`Could not create reminder: ${err?.message || err}`);
+      }
+    },
+
+    updateReminder: async (id: string, opts: any) => {
+      const setters: string[] = [];
+      if (opts?.title != null) setters.push(`set name of r to "${escapeAS(opts.title)}"`);
+      if (opts?.notes != null) setters.push(`set body of r to "${escapeAS(opts.notes)}"`);
+      if (opts?.isCompleted != null) setters.push(`set completed of r to ${opts.isCompleted ? 'true' : 'false'}`);
+      if (setters.length === 0) return { id };
+      const script = `
+tell application "Reminders"
+  set r to first reminder whose id is "${escapeAS(id)}"
+  ${setters.join('\n  ')}
+end tell`.trim();
+      try {
+        await runScript(script);
+        return { id };
+      } catch (err) {
+        console.error('[AppleReminders.updateReminder]', err);
+        throw err;
+      }
+    },
+
+    deleteReminder: async (id: string) => {
+      const script = `
+tell application "Reminders"
+  delete (first reminder whose id is "${escapeAS(id)}")
+end tell`.trim();
+      try { await runScript(script); } catch (err) {
+        console.error('[AppleReminders.deleteReminder]', err);
+      }
+    },
+
+    setCompleted: async (id: string, completed: boolean) => {
+      const script = `
+tell application "Reminders"
+  set completed of (first reminder whose id is "${escapeAS(id)}") to ${completed ? 'true' : 'false'}
+end tell`.trim();
+      try { await runScript(script); } catch (err) {
+        console.error('[AppleReminders.setCompleted]', err);
+      }
+    },
+
+    // No-op stubs for less common exports that may exist in the Swift module.
+    // Returning sensible defaults keeps the extension UI functional even if
+    // it iterates these results.
+    getReminder: async () => null,
+    searchReminders: async () => [],
+    createList: async () => ({ id: '', title: '' }),
+    updateList: async () => ({}),
+    deleteList: async () => {},
+  };
+}
+
+/**
  * Execute extension code and extract the default export.
  * Returns either a React component or a raw function (for no-view commands).
  *
@@ -3305,7 +3570,8 @@ function ensureGlobals() {
  */
 function loadExtensionExport(
   code: string,
-  extensionPath?: string
+  extensionPath?: string,
+  timerRegistry?: TimerRegistry
 ): Function | null {
   const patchSchemeDynamicImports = (sourceCode: string): string => {
     // Extension bundles may emit dynamic imports for native Raycast bridges
@@ -3505,6 +3771,59 @@ function loadExtensionExport(
             },
           };
         }
+        if (name.includes('AppleReminders')) {
+          return createAppleRemindersBridge();
+        }
+        // clean-keyboard extension uses `swift:.../MyExecutable` for the
+        // CGEventTap-based keyboard lock. Bridge to our native helper.
+        if (name.includes('MyExecutable') || name.includes('keyboard')) {
+          return {
+            handler: async (duration: number) => {
+              const result = await window.electron.keyboardLockStart(Number(duration) || 15);
+              if (!result?.ok) {
+                throw new Error(result?.error || 'Failed to lock keyboard');
+              }
+            },
+            stopHandler: async () => {
+              await window.electron.keyboardLockStop();
+            },
+          };
+        }
+        // screenocr extension imports from `swift:../swift` and exposes
+        // `recognizeText(...)` and `detectBarcode(...)`. Bridge to our
+        // native screen-ocr helper which wraps Vision framework + screencapture.
+        if (name.includes('ScreenOCR') || name.endsWith('/swift') || name.includes('screenocr')) {
+          return {
+            recognizeText: async (
+              fullscreen: boolean,
+              keepImage: boolean,
+              fast: boolean,
+              languageCorrection: boolean,
+              ignoreLineBreaks: boolean,
+              customWords: string[],
+              languages: string[],
+              playSound: boolean,
+            ) => {
+              const result = await window.electron.screenOcrRun('recognize', {
+                fullscreen, keepImage, fast, languageCorrection, ignoreLineBreaks,
+                customWords, languages, playSound,
+              });
+              if (!result?.ok) {
+                throw new Error(result?.error || 'OCR failed');
+              }
+              return result.text || '';
+            },
+            detectBarcode: async (keepImage: boolean, playSound: boolean) => {
+              const result = await window.electron.screenOcrRun('barcode', {
+                keepImage, playSound,
+              });
+              if (!result?.ok) {
+                throw new Error(result?.error || 'Barcode detection failed');
+              }
+              return result.text || '';
+            },
+          };
+        }
         // Unknown swift module — return empty
         return {};
       }
@@ -3523,6 +3842,19 @@ function loadExtensionExport(
                 console.error('Native color picker (rust bridge) failed:', e);
                 return undefined;
               }
+            },
+          };
+        }
+        if (name.includes('clean-keyboard') || name.includes('keyboard')) {
+          return {
+            handler: async (duration: number) => {
+              const result = await window.electron.keyboardLockStart(Number(duration) || 15);
+              if (!result?.ok) {
+                throw new Error(result?.error || 'Failed to lock keyboard');
+              }
+            },
+            stop_handler: async () => {
+              await window.electron.keyboardLockStop();
             },
           };
         }
@@ -3577,10 +3909,59 @@ function loadExtensionExport(
       throw new Error(`Unsupported dynamic import in extension runtime: ${id}`);
     };
 
+    // Sandboxed timer APIs — passed as named parameters so the extension's
+    // bundle resolves bare `setInterval`/`setTimeout`/`requestAnimationFrame`
+    // references against this scope instead of the host `window`. Handles are
+    // tracked in `timerRegistry` so the consumer (ExtensionView) can clear
+    // anything still pending on unmount, defending against extensions that
+    // forget their own cleanup (e.g. raycast/timers).
+    const trackInterval = (cb: any, ms?: any, ...rest: any[]) => {
+      const id = window.setInterval(cb as any, ms as any, ...rest);
+      timerRegistry?.intervals.add(id);
+      return id;
+    };
+    const trackClearInterval = (id: any) => {
+      if (typeof id === 'number') timerRegistry?.intervals.delete(id);
+      window.clearInterval(id);
+    };
+    const trackTimeout = (cb: any, ms?: any, ...rest: any[]) => {
+      const id = window.setTimeout(cb as any, ms as any, ...rest);
+      timerRegistry?.timeouts.add(id);
+      return id;
+    };
+    const trackClearTimeout = (id: any) => {
+      if (typeof id === 'number') timerRegistry?.timeouts.delete(id);
+      window.clearTimeout(id);
+    };
+    const trackRaf = (cb: FrameRequestCallback) => {
+      const id = window.requestAnimationFrame(cb);
+      timerRegistry?.rafs.add(id);
+      return id;
+    };
+    const trackCancelRaf = (id: any) => {
+      if (typeof id === 'number') timerRegistry?.rafs.delete(id);
+      window.cancelAnimationFrame(id);
+    };
+    // setImmediate / clearImmediate are Node-isms not on `window` — polyfill
+    // via setTimeout(0) and route through the same registry.
+    const trackSetImmediate = (cb: Function, ...args: any[]) =>
+      trackTimeout(() => cb(...args), 0);
+    const trackClearImmediate = (id: any) => trackClearTimeout(id);
+
     // Execute the CJS bundle in a function scope.
     // We pass all the standard CJS arguments plus `process`, `Buffer`,
     // and `global` to ensure they are always in scope even when the
     // extension code references them without importing.
+    // Browser-detection bypass — the OpenAI v4 SDK (and several other
+    // "isomorphic" SDKs) refuse to start unless the caller passes
+    // `dangerouslyAllowBrowser: true`. The check is
+    //   typeof window !== 'undefined' && typeof window.document !== 'undefined' && typeof navigator !== 'undefined'
+    // Shadowing `navigator` with `undefined` in the bundle's lexical scope
+    // makes the third clause false, the SDK loads, and the extension's calls
+    // still go through our fetch proxy (which keeps the API key server-side
+    // anyway because requests are routed through the main process). Code
+    // that genuinely needs navigator can still reach it via
+    // `globalThis.navigator` or `window.navigator`.
     const fn = new Function(
       'exports',
       'require',
@@ -3593,6 +3974,13 @@ function loadExtensionExport(
       'globalThis',
       'setImmediate',
       'clearImmediate',
+      'setInterval',
+      'clearInterval',
+      'setTimeout',
+      'clearTimeout',
+      'requestAnimationFrame',
+      'cancelAnimationFrame',
+      'navigator',
       '__scDynamicImport',
       executableCode
     );
@@ -3607,8 +3995,15 @@ function loadExtensionExport(
       bundleBuffer,
       globalThis,
       globalThis,
-      (cb: Function, ...args: any[]) => setTimeout(() => cb(...args), 0),
-      clearTimeout,
+      trackSetImmediate,
+      trackClearImmediate,
+      trackInterval,
+      trackClearInterval,
+      trackTimeout,
+      trackClearTimeout,
+      trackRaf,
+      trackCancelRaf,
+      undefined, // navigator — see comment above
       scDynamicImport,
     );
 
@@ -3710,6 +4105,10 @@ const NoViewRunner: React.FC<{
           }
           setStatus('error');
           setErrorMsg(e?.message || 'Command failed');
+          // Mirror the success path — a thrown no-view command must still
+          // dismiss itself, otherwise the bundle + React subtree stay in
+          // backgroundNoViewRuns forever and accumulate on every interval tick.
+          closeTimerRef.current = window.setTimeout(() => onCloseRef.current(), 1500);
         }
       }
     })();
@@ -3845,13 +4244,30 @@ const ExtensionView: React.FC<ExtensionViewProps> = ({
     setExtensionContext(extensionCtx);
   }, [extensionCtx]);
 
+  // Per-instance timer registry: any setInterval/setTimeout/requestAnimationFrame
+  // created by the extension's bundle is recorded here. On unmount we force-clear
+  // anything still pending so a buggy extension cannot leak DOMTimers + retained
+  // React fibers into the host renderer.
+  const timerRegistryRef = useRef<TimerRegistry>();
+  if (!timerRegistryRef.current) timerRegistryRef.current = createTimerRegistry();
+  useEffect(() => {
+    return () => {
+      if (timerRegistryRef.current) clearTimerRegistry(timerRegistryRef.current);
+    };
+  }, []);
+
   // Load the extension's default export (skip if there was a build error)
   const ExtExport = useMemo(() => {
     if (buildError || !code) return null;
+    // If the bundle is being re-evaluated (deps changed), drop any timers from
+    // the prior evaluation before the new one starts producing more.
+    if (timerRegistryRef.current) clearTimerRegistry(timerRegistryRef.current);
     // Module scope code can call getPreferenceValues() immediately.
     // Load under the extension's scoped context so other async extension work
     // cannot leak a different context into this bundle.
-    return withExtensionContext(extensionCtx, () => loadExtensionExport(code, extensionPath));
+    return withExtensionContext(extensionCtx, () =>
+      loadExtensionExport(code, extensionPath, timerRegistryRef.current)
+    );
   }, [code, buildError, extensionCtx, extensionPath]);
 
   // Is this a no-view command? Trust the mode from package.json.
