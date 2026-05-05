@@ -480,8 +480,8 @@ const electronAPI = {
     ipcRenderer.invoke('get-frontmost-application'),
 
   // Run AppleScript
-  runAppleScript: (script: string): Promise<string> =>
-    ipcRenderer.invoke('run-applescript', script),
+  runAppleScript: (script: string, options?: { language?: string; humanReadableOutput?: boolean; timeout?: number }): Promise<string> =>
+    ipcRenderer.invoke('run-applescript', script, options),
 
   // Calendar
   ensureCalendarAccess: (options?: { prompt?: boolean }): Promise<any> =>
