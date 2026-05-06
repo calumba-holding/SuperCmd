@@ -96,6 +96,18 @@ import {
 } from './file-search-index';
 import { ensureCalendarAccess, getCalendarEvents } from './calendar-events';
 import {
+  openInDefaultBrowser as bsOpen,
+  resolveInput as bsResolveInput,
+  listEntries as bsListEntries,
+  clearHistory as bsClearHistory,
+  pruneByRetentionNow as bsPruneByRetention,
+  getAutocomplete as bsGetAutocomplete,
+  listImportableBrowsers as bsListImportableBrowsers,
+  importFromBrowser as bsImportFromBrowser,
+  fetchSearchSuggestion as bsFetchSearchSuggestion,
+  type BrowserSearchSource,
+} from './browser-search-history';
+import {
   initNoteStore,
   getAllNotes,
   searchNotes,
@@ -2065,6 +2077,7 @@ let pendingNoteJson: string | null = null;
 let canvasWindow: InstanceType<typeof BrowserWindow> | null = null;
 let pendingCanvasJson: string | null = null;
 let isVisible = false;
+let isAppQuitting = false;
 let suppressBlurHide = false; // When true, blur won't hide the window (used during file dialogs)
 let showWindowBlurGraceUntil = 0; // Timestamp until which blur-to-hide is suppressed after show (prevents flash-close)
 let oauthBlurHideSuppressionDepth = 0; // Keep launcher alive while OAuth browser flow is in progress
@@ -2084,6 +2097,50 @@ let globalShortcutRegistrationState: {
 const OPENING_SHORTCUT_SUPPRESSION_MS = 220;
 let openingShortcutSuppressionUntil = 0;
 let openingShortcutToSuppress = '';
+
+function setMacActivationPolicy(policy: 'regular' | 'accessory' | 'prohibited'): void {
+  if (process.platform !== 'darwin') return;
+  try {
+    (app as any).setActivationPolicy?.(policy);
+  } catch {}
+}
+
+function enterOverlayMacActivationPolicy(): void {
+  if (process.platform !== 'darwin') return;
+  // AeroSpace classifies regular-app focused AX windows as workspace windows.
+  // The launcher is an overlay, so keep the app accessory while only the
+  // launcher/overlay windows are active; AeroSpace then treats the panel like
+  // a popup and doesn't bind it to the first workspace it appeared on.
+  setMacActivationPolicy('accessory');
+  try { app.dock.hide(); } catch {}
+}
+
+function enterRegularMacActivationPolicy(): void {
+  if (process.platform !== 'darwin') return;
+  setMacActivationPolicy('regular');
+  try { app.dock.show(); } catch {}
+}
+
+function restoreOverlayMacActivationPolicyIfPossible(): void {
+  if (process.platform !== 'darwin') return;
+  if (isAppQuitting) return;
+  if (launcherMode === 'onboarding') return;
+  if (settingsWindow || extensionStoreWindow || canvasWindow) return;
+  enterOverlayMacActivationPolicy();
+}
+
+function prepareWindowsForAppQuit(): void {
+  isAppQuitting = true;
+  if (process.platform === 'darwin') {
+    setMacActivationPolicy('regular');
+  }
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win || win.isDestroyed()) continue;
+    try { win.setClosable(true); } catch {}
+    try { win.setMinimizable(true); } catch {}
+    try { win.setMaximizable(true); } catch {}
+  }
+}
 
 function getMemoryStatusWindowHtml(): string {
   return `<!doctype html>
@@ -4370,7 +4427,148 @@ let whisperEscapeRegistered = false;
 let whisperOverlayVisible = false;
 let speakOverlayVisible = false;
 let whisperChildWindow: InstanceType<typeof BrowserWindow> | null = null;
+let whisperOverlayOpeningGuardUntil = 0;
+let whisperSuperCmdTextTargetWindow: InstanceType<typeof BrowserWindow> | null = null;
 const LAUNCHER_SELECTION_SNAPSHOT_TTL_MS = 15_000;
+
+function markWhisperOverlayOpening(): void {
+  whisperOverlayOpeningGuardUntil = Date.now() + 1500;
+}
+
+function isWhisperOverlayActiveOrOpening(): boolean {
+  return whisperOverlayVisible || Date.now() < whisperOverlayOpeningGuardUntil;
+}
+
+function isWhisperSuperCmdTextTargetWindow(win: InstanceType<typeof BrowserWindow> | null | undefined): boolean {
+  if (!win || win.isDestroyed()) return false;
+  return win === mainWindow || win === notesWindow || win === canvasWindow;
+}
+
+function buildWhisperTextTargetCaptureScript(): string {
+  return `
+    (() => {
+      const editableSelector = '[contenteditable=""], [contenteditable="true"], [contenteditable="plaintext-only"]';
+      const getEditableFromSelection = () => {
+        const selection = window.getSelection && window.getSelection();
+        const node = selection && selection.anchorNode;
+        const element = node instanceof HTMLElement ? node : (node && node.parentElement);
+        const editable = element && element.closest && element.closest(editableSelector);
+        return editable instanceof HTMLElement ? editable : null;
+      };
+      const dispatchInput = (element, text) => {
+        try {
+          element.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
+        } catch (_) {
+          element.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+      };
+      const setNativeValue = (element, value) => {
+        const proto = element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+        if (descriptor && descriptor.set) descriptor.set.call(element, value);
+        else element.value = value;
+      };
+      const capture = () => {
+        const active = document.activeElement;
+        if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) {
+          if (active.disabled || active.readOnly) return null;
+          const inputType = active instanceof HTMLInputElement ? String(active.type || 'text').toLowerCase() : 'textarea';
+          if (active instanceof HTMLInputElement && !['', 'text', 'search', 'url', 'tel', 'email', 'password', 'number'].includes(inputType)) return null;
+          return {
+            kind: 'input',
+            element: active,
+            selectionStart: active.selectionStart == null ? active.value.length : active.selectionStart,
+            selectionEnd: active.selectionEnd == null ? active.value.length : active.selectionEnd,
+          };
+        }
+        const editable = active instanceof HTMLElement && active.isContentEditable ? active : getEditableFromSelection();
+        if (!editable) return null;
+        const selection = window.getSelection && window.getSelection();
+        let range = null;
+        if (selection && selection.rangeCount > 0) {
+          const candidate = selection.getRangeAt(0);
+          if (editable.contains(candidate.commonAncestorContainer)) range = candidate.cloneRange();
+        }
+        return { kind: 'contenteditable', element: editable, range };
+      };
+      window.__supercmdWhisperTextTarget = capture();
+      window.__supercmdInsertWhisperText = (rawText) => {
+        const text = String(rawText || '');
+        const target = window.__supercmdWhisperTextTarget;
+        if (!text || !target || !target.element || !target.element.isConnected) return false;
+        try { target.element.focus({ preventScroll: true }); } catch (_) { try { target.element.focus(); } catch (_) {} }
+        if (target.kind === 'input') {
+          const value = target.element.value || '';
+          const start = Math.max(0, Math.min(value.length, target.selectionStart || 0));
+          const end = Math.max(start, Math.min(value.length, target.selectionEnd || start));
+          setNativeValue(target.element, value.slice(0, start) + text + value.slice(end));
+          const cursor = start + text.length;
+          try { target.element.setSelectionRange(cursor, cursor); } catch (_) {}
+          target.selectionStart = cursor;
+          target.selectionEnd = cursor;
+          dispatchInput(target.element, text);
+          return true;
+        }
+        const selection = window.getSelection && window.getSelection();
+        if (!selection) return false;
+        let range = target.range;
+        if (!range || !target.element.contains(range.commonAncestorContainer)) {
+          range = document.createRange();
+          range.selectNodeContents(target.element);
+          range.collapse(false);
+        }
+        selection.removeAllRanges();
+        selection.addRange(range);
+        let inserted = false;
+        try { inserted = document.execCommand('insertText', false, text); } catch (_) { inserted = false; }
+        if (!inserted) {
+          range.deleteContents();
+          const textNode = document.createTextNode(text);
+          range.insertNode(textNode);
+          range.setStartAfter(textNode);
+          range.collapse(true);
+          selection.removeAllRanges();
+          selection.addRange(range);
+        }
+        if (selection.rangeCount > 0) target.range = selection.getRangeAt(0).cloneRange();
+        dispatchInput(target.element, text);
+        return true;
+      };
+      return Boolean(window.__supercmdWhisperTextTarget);
+    })();
+  `;
+}
+
+function captureWhisperSuperCmdTextTarget(): void {
+  const focusedWindow = BrowserWindow.getFocusedWindow() as InstanceType<typeof BrowserWindow> | null;
+  if (!isWhisperSuperCmdTextTargetWindow(focusedWindow)) {
+    whisperSuperCmdTextTargetWindow = null;
+    return;
+  }
+  void focusedWindow.webContents.executeJavaScript(buildWhisperTextTargetCaptureScript(), true)
+    .then((captured: unknown) => {
+      whisperSuperCmdTextTargetWindow = captured ? focusedWindow : null;
+    })
+    .catch(() => {
+      if (whisperSuperCmdTextTargetWindow === focusedWindow) {
+        whisperSuperCmdTextTargetWindow = null;
+      }
+    });
+}
+
+async function insertTextIntoWhisperSuperCmdTarget(text: string): Promise<boolean> {
+  const targetWindow = whisperSuperCmdTextTargetWindow;
+  if (!isWhisperSuperCmdTextTargetWindow(targetWindow)) return false;
+  const textLiteral = JSON.stringify(String(text || ''));
+  try {
+    return Boolean(await targetWindow.webContents.executeJavaScript(
+      `Boolean(window.__supercmdInsertWhisperText && window.__supercmdInsertWhisperText(${textLiteral}))`,
+      true
+    ));
+  } catch {
+    return false;
+  }
+}
 
 function registerWhisperEscapeShortcut(): void {
   if (whisperEscapeRegistered) return;
@@ -7033,6 +7231,9 @@ function createWindow(): void {
     frame: false,
     hasShadow: false,
     resizable: false,
+    minimizable: false,
+    maximizable: false,
+    closable: false,
     skipTaskbar: true,
     alwaysOnTop: true,
     show: false,
@@ -7307,6 +7508,7 @@ function createWindow(): void {
       isVisible &&
       !suppressBlurHide &&
       oauthBlurHideSuppressionDepth === 0 &&
+      !isWhisperOverlayActiveOrOpening() &&
       launcherMode !== 'whisper' &&
       launcherMode !== 'speak' &&
       launcherMode !== 'onboarding'
@@ -7866,12 +8068,13 @@ function setLauncherMode(mode: LauncherMode): void {
       if (mode === 'onboarding') {
         // Make onboarding behave like a normal app window — visible in dock and
         // Mission Control, doesn't drop behind other windows.
+        enterRegularMacActivationPolicy();
+        try { mainWindow.setClosable(true); } catch {}
+        try { mainWindow.setMinimizable(true); } catch {}
+        try { mainWindow.setMaximizable(true); } catch {}
         mainWindow.setAlwaysOnTop(false);
         mainWindow.setSkipTaskbar(false);
         try { mainWindow.setHiddenInMissionControl(false); } catch {}
-        if (process.platform === 'darwin') {
-          try { app.dock.show(); } catch {}
-        }
         mainWindow.setVisibleOnAllWorkspaces(false, {
           visibleOnFullScreen: true,
           skipTransformProcessType: process.platform === 'darwin',
@@ -7879,10 +8082,11 @@ function setLauncherMode(mode: LauncherMode): void {
       } else {
         mainWindow.setAlwaysOnTop(true);
         mainWindow.setSkipTaskbar(true);
+        try { mainWindow.setClosable(false); } catch {}
+        try { mainWindow.setMinimizable(false); } catch {}
+        try { mainWindow.setMaximizable(false); } catch {}
         try { mainWindow.setHiddenInMissionControl(true); } catch {}
-        if (process.platform === 'darwin' && prevMode === 'onboarding') {
-          try { app.dock.hide(); } catch {}
-        }
+        restoreOverlayMacActivationPolicyIfPossible();
         setLauncherOverlayTopmost(true);
       }
     } catch {}
@@ -8205,6 +8409,13 @@ function openPreferredDevTools(): boolean {
 }
 
 async function activateLastFrontmostApp(): Promise<boolean> {
+  if (isWhisperSuperCmdTextTargetWindow(whisperSuperCmdTextTargetWindow)) {
+    try {
+      whisperSuperCmdTextTargetWindow.show();
+      whisperSuperCmdTextTargetWindow.focus();
+      return true;
+    } catch {}
+  }
   if (!lastFrontmostApp) return false;
   const { execFile } = require('child_process');
   const { promisify } = require('util');
@@ -9106,10 +9317,9 @@ async function openLauncherFromUserEntry(): Promise<void> {
     return;
   }
 
-  // Returning user — hide dock for overlay-only behaviour, then show window.
-  if (process.platform === 'darwin') {
-    app.dock.hide();
-  }
+  // Returning user — keep the launcher as an accessory overlay so tiling WMs
+  // such as AeroSpace don't bind it to the first workspace where it appears.
+  enterOverlayMacActivationPolicy();
   setLauncherMode('default');
   await showWindow();
 }
@@ -9142,6 +9352,10 @@ async function openLauncherAndRunSystemCommand(
   }
   if (preserveFocusWhenHidden) {
     captureFrontmostAppContext();
+  }
+  if (commandId === 'system-supercmd-whisper') {
+    captureWhisperSuperCmdTextTarget();
+    markWhisperOverlayOpening();
   }
   setLauncherMode(options?.mode || 'default');
 
@@ -10768,6 +10982,7 @@ function registerCloseWindowShortcut(
 }
 
 function openSettingsWindow(payload?: SettingsNavigationPayload): void {
+  enterRegularMacActivationPolicy();
   if (settingsWindow) {
     if (payload) {
       settingsWindow.webContents.send('settings-tab-changed', payload);
@@ -10775,10 +10990,6 @@ function openSettingsWindow(payload?: SettingsNavigationPayload): void {
     settingsWindow.show();
     settingsWindow.focus();
     return;
-  }
-
-  if (process.platform === 'darwin') {
-    app.dock.show();
   }
 
   const { x: displayX, y: displayY, width: displayWidth, height: displayHeight } = (() => {
@@ -10837,10 +11048,7 @@ function openSettingsWindow(payload?: SettingsNavigationPayload): void {
 
   settingsWindow.on('closed', () => {
     settingsWindow = null;
-    // Hide dock again when no settings/store/notes windows are open
-    if (process.platform === 'darwin' && !extensionStoreWindow && !notesWindow) {
-      app.dock.hide();
-    }
+    restoreOverlayMacActivationPolicyIfPossible();
   });
 }
 
@@ -10987,25 +11195,20 @@ function openNotesWindow(mode?: 'search' | 'create'): void {
 
   notesWindow.on('closed', () => {
     notesWindow = null;
-    if (process.platform === 'darwin' && !settingsWindow && !extensionStoreWindow && !canvasWindow) {
-      app.dock.hide();
-    }
+    restoreOverlayMacActivationPolicyIfPossible();
   });
 }
 
 // ─── Canvas Window ────────────────────────────────────────────────
 
 function openCanvasWindow(mode?: 'create' | 'edit'): void {
+  enterRegularMacActivationPolicy();
   if (canvasWindow) {
     canvasWindow.webContents.send('canvas-mode-changed', { mode: mode || 'create', canvasJson: pendingCanvasJson });
     pendingCanvasJson = null;
     canvasWindow.show();
     canvasWindow.focus();
     return;
-  }
-
-  if (process.platform === 'darwin') {
-    app.dock.show();
   }
 
   const { x: displayX, y: displayY, width: displayWidth, height: displayHeight } = (() => {
@@ -11134,6 +11337,7 @@ function openCanvasWindow(mode?: 'create' | 'edit'): void {
 
   let savingBeforeClose = false;
   canvasWindow.on('close', (event: any) => {
+    if (isAppQuitting) return;
     if (savingBeforeClose) return;
     event.preventDefault();
     savingBeforeClose = true;
@@ -11146,9 +11350,7 @@ function openCanvasWindow(mode?: 'create' | 'edit'): void {
 
   canvasWindow.on('closed', () => {
     canvasWindow = null;
-    if (process.platform === 'darwin' && !settingsWindow && !extensionStoreWindow && !notesWindow) {
-      app.dock.hide();
-    }
+    restoreOverlayMacActivationPolicyIfPossible();
   });
 }
 
@@ -11241,14 +11443,11 @@ async function installCanvasLib(sender: any): Promise<void> {
 }
 
 function openExtensionStoreWindow(): void {
+  enterRegularMacActivationPolicy();
   if (extensionStoreWindow) {
     extensionStoreWindow.show();
     extensionStoreWindow.focus();
     return;
-  }
-
-  if (process.platform === 'darwin') {
-    app.dock.show();
   }
 
   const { x: displayX, y: displayY, width: displayWidth, height: displayHeight } = (() => {
@@ -11303,9 +11502,7 @@ function openExtensionStoreWindow(): void {
 
   extensionStoreWindow.on('closed', () => {
     extensionStoreWindow = null;
-    if (process.platform === 'darwin' && !settingsWindow && !notesWindow) {
-      app.dock.hide();
-    }
+    restoreOverlayMacActivationPolicyIfPossible();
   });
 }
 
@@ -11379,6 +11576,15 @@ function broadcastCommandsUpdated(): void {
     if (window.isDestroyed()) continue;
     try {
       window.webContents.send('commands-updated');
+    } catch {}
+  }
+}
+
+function broadcastBrowserSearchHistoryChanged(): void {
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (window.isDestroyed()) continue;
+    try {
+      window.webContents.send('browser-search-history-changed');
     } catch {}
   }
 }
@@ -12353,6 +12559,7 @@ app.whenReady().then(async () => {
         lastWhisperShownAt = Date.now();
       } else {
         whisperHoldRequestSeq += 1;
+        whisperSuperCmdTextTargetWindow = null;
         stopWhisperHoldWatcher();
       }
       return;
@@ -12705,9 +12912,7 @@ app.whenReady().then(async () => {
       // deferred to avoid triggering permission dialogs during onboarding.
       if (patch.hasSeenOnboarding === true) {
         fnWatcherOnboardingOverride = false;
-        if (process.platform === 'darwin') {
-          app.dock.hide();
-        }
+        enterOverlayMacActivationPolicy();
         startClipboardMonitor();
         setClipboardAppBlacklist(loadSettings().clipboardAppBlacklist);
         syncFnSpeakToggleWatcher(loadSettings().commandHotkeys);
@@ -13877,13 +14082,28 @@ return appURL's |path|() as text`,
   });
 
   // Run AppleScript
-  ipcMain.handle('run-applescript', async (_event: any, script: string) => {
+  ipcMain.handle('run-applescript', async (_event: any, script: string, options?: { language?: string; humanReadableOutput?: boolean; timeout?: number }) => {
     try {
       const { spawnSync } = require('child_process');
-      const proc = spawnSync('/usr/bin/osascript', ['-l', 'AppleScript'], {
+      const rawLanguage = String(options?.language || 'AppleScript').trim();
+      const language = /^javascript$/i.test(rawLanguage) ? 'JavaScript' : 'AppleScript';
+      const args = ['-l', language];
+      if (options?.humanReadableOutput === false) {
+        args.push('-s', 's');
+      }
+      const timeout = typeof options?.timeout === 'number' && Number.isFinite(options.timeout)
+        ? Math.max(1, Math.min(options.timeout, 5 * 60 * 1000))
+        : undefined;
+
+      const proc = spawnSync('/usr/bin/osascript', args, {
         input: script,
         encoding: 'utf-8',
+        timeout,
       });
+
+      if (proc.error) {
+        throw proc.error;
+      }
 
       if (proc.status !== 0) {
         const stderr = (proc.stderr || '').trim() || 'AppleScript execution failed';
@@ -14474,6 +14694,69 @@ if let tiff = image?.tiffRepresentation {
     }
   });
 
+  // ─── IPC: Browser Search ────────────────────────────────────────
+
+  ipcMain.handle('browser-search:open', async (_event: any, input: string) => {
+    const result = await bsOpen(String(input || ''));
+    if (result.ok) {
+      try {
+        broadcastBrowserSearchHistoryChanged();
+      } catch {}
+    }
+    return {
+      ok: result.ok,
+      type: result.resolved?.type ?? null,
+      url: result.resolved?.url ?? null,
+    };
+  });
+
+  ipcMain.handle('browser-search:resolve', (_event: any, input: string) => {
+    const resolved = bsResolveInput(String(input || ''));
+    if (!resolved) return null;
+    return { type: resolved.type, url: resolved.url, host: resolved.host };
+  });
+
+  ipcMain.handle('browser-search:list-entries', () => {
+    return bsListEntries();
+  });
+
+  ipcMain.handle('browser-search:autocomplete', (_event: any, input: string) => {
+    return bsGetAutocomplete(String(input || ''));
+  });
+
+  ipcMain.handle('browser-search:suggest', async (_event: any, input: string) => {
+    return await bsFetchSearchSuggestion(String(input || ''));
+  });
+
+  ipcMain.handle('browser-search:clear-history', () => {
+    bsClearHistory();
+    try {
+      broadcastBrowserSearchHistoryChanged();
+    } catch {}
+    return true;
+  });
+
+  ipcMain.handle('browser-search:list-browsers', () => {
+    return bsListImportableBrowsers().map((b) => ({
+      id: b.id,
+      name: b.name,
+      available: b.available,
+    }));
+  });
+
+  ipcMain.handle('browser-search:import', async (_event: any, browserId: BrowserSearchSource) => {
+    const result = await bsImportFromBrowser(browserId);
+    try {
+      broadcastBrowserSearchHistoryChanged();
+    } catch {}
+    return result;
+  });
+
+  // Run a retention prune on startup so out-of-window entries don't linger.
+  try {
+    bsPruneByRetention();
+  } catch {}
+
   ipcMain.handle('get-selected-text', async () => {
     const fresh = String(await getSelectedTextForSpeak() || '');
     if (fresh.trim().length > 0) {
@@ -14596,10 +14879,16 @@ if let tiff = image?.tiffRepresentation {
       }
     }
 
-    const success = copySnippetToClipboard(id);
-    if (!success) return false;
+    const text = renderSnippetById(id);
+    if (text == null) return false;
 
-    return await hideAndPaste();
+    // Hide the launcher so the paste lands in the previously focused app.
+    if (isVisible) hideWindow();
+
+    // pasteTextToActiveApp saves the user's clipboard, writes the snippet,
+    // pastes it via the active app, then restores the original clipboard —
+    // so the snippet text doesn't linger on the pasteboard.
+    return await pasteTextToActiveApp(text);
   });
 
   ipcMain.handle('snippet-paste-resolved', async (_event: any, id: string, dynamicValues?: Record<string, string>) => {
@@ -14614,10 +14903,12 @@ if let tiff = image?.tiffRepresentation {
       }
     }
 
-    const success = copySnippetToClipboardResolved(id, dynamicValues);
-    if (!success) return false;
+    const text = renderSnippetById(id, dynamicValues);
+    if (text == null) return false;
 
-    return await hideAndPaste();
+    if (isVisible) hideWindow();
+
+    return await pasteTextToActiveApp(text);
   });
 
   ipcMain.handle('snippet-import', async (event: any) => {
@@ -14967,6 +15258,10 @@ if let tiff = image?.tiffRepresentation {
     const nextText = String(text || '');
     if (!nextText) {
       return { typed: false, fallbackClipboard: false };
+    }
+
+    if (await insertTextIntoWhisperSuperCmdTarget(nextText)) {
+      return { typed: true, fallbackClipboard: false };
     }
 
     await activateLastFrontmostApp();
@@ -16486,6 +16781,12 @@ if let tiff = image?.tiffRepresentation {
 
   // ─── Window + Shortcuts ─────────────────────────────────────────
 
+  if (settings.hasSeenOnboarding) {
+    enterOverlayMacActivationPolicy();
+  } else {
+    enterRegularMacActivationPolicy();
+  }
+
   createWindow();
   startInstalledAppsWatchers();
   schedulePromptWindowPrewarm();
@@ -16500,6 +16801,7 @@ if let tiff = image?.tiffRepresentation {
     if (focusedWindow === mainWindow) return;
     if (suppressBlurHide) return;
     if (oauthBlurHideSuppressionDepth > 0) return;
+    if (isWhisperOverlayActiveOrOpening()) return;
     if (launcherMode !== 'default') return;
     hideWindow();
   });
@@ -16565,7 +16867,12 @@ app.on('window-all-closed', () => {
   }
 });
 
+app.on('before-quit', () => {
+  prepareWindowsForAppQuit();
+});
+
 app.on('will-quit', () => {
+  prepareWindowsForAppQuit();
   stopInstalledAppsWatchers();
   globalShortcut.unregisterAll();
   if (windowManagerWorkerRestartTimer) {
