@@ -14,9 +14,10 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
 import { fork, type ChildProcess } from 'child_process';
+import { getNativeBinaryPath, resolvePackagedUnpackedPath } from './native-binary';
 import { getAvailableCommands, executeCommand, invalidateCache } from './commands';
-import { loadSettings, saveSettings, setOAuthToken, getOAuthToken, removeOAuthToken, loadWindowState, saveWindowState, clearWindowState, loadNotesWindowState, saveNotesWindowState } from './settings-store';
-import type { AppSettings } from './settings-store';
+import { loadSettings, saveSettings, setOAuthToken, getOAuthToken, removeOAuthToken, loadWindowState, saveWindowState, clearWindowState, loadNotesWindowState, saveNotesWindowState, loadSettingsLocation, getDefaultSettingsPath, relocateSettingsFile, resetSettingsLocation, startSettingsWatcher, setSettingsBroadcaster, setExternalSettingsChangeHandler, settingsFileExistsOrICloudPlaceholder } from './settings-store';
+import type { AppSettings, RelocateMode } from './settings-store';
 import { streamAI, streamAIChat, isAIAvailable, transcribeAudio } from './ai-provider';
 import * as soulverCalculator from './soulver-calculator';
 import { addMemory, buildMemoryContextSystemPrompt } from './memory';
@@ -171,28 +172,6 @@ try {
 
 // ─── Native Binary Helpers ──────────────────────────────────────────
 
-/**
- * Resolve the path to a pre-compiled native binary in dist/native/.
- * In packaged apps the dist/native/ directory lives in app.asar.unpacked
- * (see asarUnpack in package.json), so we swap the asar path for the
- * unpacked one — child_process.spawn is not asar-aware.
- */
-function resolvePackagedUnpackedPath(candidatePath: string): string {
-  if (!app.isPackaged) return candidatePath;
-  if (!candidatePath.includes('app.asar')) return candidatePath;
-  const unpackedPath = candidatePath.replace('app.asar', 'app.asar.unpacked');
-  try {
-    if (fs.existsSync(unpackedPath)) {
-      return unpackedPath;
-    }
-  } catch {}
-  return candidatePath;
-}
-
-function getNativeBinaryPath(name: string): string {
-  const base = path.join(__dirname, '..', 'native', name);
-  return resolvePackagedUnpackedPath(base);
-}
 
 const WHISPERCPP_FRAMEWORK_VERSION = 'v1.8.3';
 const WHISPERCPP_MODEL_NAME = 'base';
@@ -12810,6 +12789,208 @@ app.whenReady().then(async () => {
     return loadSettings();
   });
 
+  // ─── Synced Extension List Helpers ──────────────────────────────
+  // Keep settings.installedExtensions in sync with install/uninstall events.
+  // The list represents user install intent. Uninstall tombstones represent
+  // synced removal intent, so another Mac with a stale extension folder does
+  // not resurrect the extension globally on launch.
+
+  function addInstalledExtensionToSettings(name: string): void {
+    const trimmed = String(name || '').trim();
+    if (!trimmed) return;
+    const current = loadSettings();
+    const existing = current.installedExtensions || [];
+    const extensionUninstallTombstones = { ...(current.extensionUninstallTombstones || {}) };
+    const hadTombstone = Object.prototype.hasOwnProperty.call(extensionUninstallTombstones, trimmed);
+    if (hadTombstone) delete extensionUninstallTombstones[trimmed];
+    const installedExtensions = existing.includes(trimmed) ? existing : [...existing, trimmed];
+    if (existing.includes(trimmed) && !hadTombstone) return;
+    const updated = saveSettings({ installedExtensions, extensionUninstallTombstones });
+    broadcastSettingsToAllWindows(updated);
+  }
+
+  function removeInstalledExtensionFromSettings(name: string): void {
+    const trimmed = String(name || '').trim();
+    if (!trimmed) return;
+    const current = loadSettings();
+    const existing = current.installedExtensions || [];
+    const extensionUninstallTombstones = {
+      ...(current.extensionUninstallTombstones || {}),
+      [trimmed]: Date.now(),
+    };
+    const updated = saveSettings({
+      installedExtensions: existing.filter((entry) => entry !== trimmed),
+      extensionUninstallTombstones,
+    });
+    broadcastSettingsToAllWindows(updated);
+  }
+
+  /**
+   * On app launch only: reconcile the synced installedExtensions list with
+   * what's actually on disk.
+   *  - Filesystem-only extensions (the typical first-run state) are added
+   *    to settings.installedExtensions so the user's other Macs pick them
+   *    up.
+   *  - Filesystem-only extensions with synced uninstall tombstones are stale
+   *    local folders from another Mac and are removed locally, not re-added.
+   *  - Settings-only entries (delivered by cloud sync from another Mac)
+   *    are queued for background install. Surfaced via the memory status
+   *    bar; failures are logged but don't block.
+   */
+  let autoInstallInFlight = false;
+  async function autoInstallMissingExtensions(): Promise<void> {
+    if (autoInstallInFlight) return;
+    autoInstallInFlight = true;
+    try {
+      await runAutoInstallMissingExtensions();
+    } finally {
+      autoInstallInFlight = false;
+    }
+  }
+  async function runAutoInstallMissingExtensions(): Promise<void> {
+    let current: AppSettings;
+    try {
+      current = loadSettings();
+    } catch (e) {
+      console.warn('autoInstallMissingExtensions: loadSettings failed:', e);
+      return;
+    }
+    const onDisk = new Set<string>();
+    try {
+      for (const name of getInstalledExtensionNames()) onDisk.add(name);
+    } catch (e) {
+      console.warn('autoInstallMissingExtensions: filesystem scan failed:', e);
+      return;
+    }
+    const inSettings = new Set<string>(current.installedExtensions || []);
+    const uninstallTombstones = current.extensionUninstallTombstones || {};
+
+    // 1) Reconcile anything on disk that isn't yet in settings. Legacy
+    // filesystem-only installs are imported; tombstoned folders are stale.
+    const extra: string[] = [];
+    const stale: string[] = [];
+    for (const name of onDisk) {
+      if (inSettings.has(name)) continue;
+      if (Object.prototype.hasOwnProperty.call(uninstallTombstones, name)) {
+        stale.push(name);
+      } else {
+        extra.push(name);
+      }
+    }
+    if (stale.length > 0) {
+      console.log(`[auto-install] removing ${stale.length} tombstoned extension folder(s): ${stale.join(', ')}`);
+      let removedAny = false;
+      for (const name of stale) {
+        try {
+          const ok = await uninstallExtension(name);
+          if (ok) {
+            onDisk.delete(name);
+            removedAny = true;
+            broadcastExtensionUninstalled(name);
+          } else {
+            console.warn(`[auto-install] failed to remove tombstoned extension folder: ${name}`);
+          }
+        } catch (e) {
+          console.warn(`[auto-install] error removing tombstoned extension folder ${name}:`, e);
+        }
+      }
+      if (removedAny) {
+        invalidateCache();
+        broadcastExtensionsUpdated();
+      }
+    }
+    if (extra.length > 0) {
+      const merged = [...(current.installedExtensions || []), ...extra];
+      const updated = saveSettings({ installedExtensions: merged });
+      broadcastSettingsToAllWindows(updated);
+    }
+
+    // 2) Install anything in settings that isn't on disk yet.
+    const missing: string[] = [];
+    for (const name of inSettings) {
+      if (!onDisk.has(name)) missing.push(name);
+    }
+    if (missing.length === 0) return;
+
+    console.log(`[auto-install] ${missing.length} extension(s) to install: ${missing.join(', ')}`);
+    let succeeded = 0;
+    for (const name of missing) {
+      try {
+        void showMemoryStatusBar('processing', `Installing ${name}…`);
+        const ok = await installExtension(name);
+        if (ok) {
+          succeeded += 1;
+          invalidateCache();
+          broadcastExtensionsUpdated();
+        } else {
+          console.warn(`[auto-install] failed: ${name}`);
+          void showMemoryStatusBar('error', `Could not install ${name}`);
+        }
+      } catch (e) {
+        console.warn(`[auto-install] error installing ${name}:`, e);
+        void showMemoryStatusBar('error', `Could not install ${name}`);
+      }
+    }
+    if (succeeded > 0) {
+      void showMemoryStatusBar(
+        'success',
+        succeeded === missing.length
+          ? `Installed ${succeeded} extension${succeeded === 1 ? '' : 's'}`
+          : `Installed ${succeeded} of ${missing.length} extensions`
+      );
+    }
+  }
+
+  // ─── IPC: Extension Preferences (synced) ────────────────────────
+  // The renderer's persistExtensionPreferences/persistCommandArguments
+  // helpers continue to write to localStorage (synchronous read cache);
+  // these handlers mirror the values into the synced settings file so
+  // they propagate across Macs.
+
+  ipcMain.handle(
+    'save-extension-preferences',
+    async (
+      _event: any,
+      args: { extName: string; cmdName?: string; extPrefs?: Record<string, unknown>; cmdPrefs?: Record<string, unknown> }
+    ) => {
+      const extName = String(args?.extName || '').trim();
+      if (!extName) return loadSettings();
+      const cmdName = String(args?.cmdName || '').trim();
+      const current = loadSettings();
+      const extensionPreferences = { ...(current.extensionPreferences || {}) };
+      const extensionCommandPreferences = { ...(current.extensionCommandPreferences || {}) };
+      if (args?.extPrefs && typeof args.extPrefs === 'object') {
+        extensionPreferences[extName] = args.extPrefs;
+      }
+      if (cmdName && args?.cmdPrefs && typeof args.cmdPrefs === 'object') {
+        const key = `${extName}/${cmdName}`;
+        extensionCommandPreferences[key] = args.cmdPrefs;
+      }
+      const result = saveSettings({ extensionPreferences, extensionCommandPreferences });
+      broadcastSettingsToAllWindows(result);
+      return result;
+    }
+  );
+
+  ipcMain.handle(
+    'save-extension-command-arguments',
+    async (
+      _event: any,
+      args: { extName: string; cmdName: string; values: Record<string, unknown> }
+    ) => {
+      const extName = String(args?.extName || '').trim();
+      const cmdName = String(args?.cmdName || '').trim();
+      if (!extName || !cmdName) return loadSettings();
+      const current = loadSettings();
+      const extensionCommandArguments = { ...(current.extensionCommandArguments || {}) };
+      const key = `${extName}/${cmdName}`;
+      extensionCommandArguments[key] = (args?.values && typeof args.values === 'object') ? args.values : {};
+      const result = saveSettings({ extensionCommandArguments });
+      broadcastSettingsToAllWindows(result);
+      return result;
+    }
+  );
+
   ipcMain.handle('resize-launcher-window', (_event: any, expanded: boolean) => {
     if (!mainWindow) return;
     const curBounds = mainWindow.getBounds();
@@ -12888,18 +13069,55 @@ app.whenReady().then(async () => {
     }
   });
 
+  function broadcastSettingsToAllWindows(result: AppSettings): void {
+    const windowsToNotify = [mainWindow, settingsWindow, extensionStoreWindow, promptWindow]
+      .filter(Boolean) as Array<InstanceType<typeof BrowserWindow>>;
+    for (const win of windowsToNotify) {
+      if (win.isDestroyed()) continue;
+      try {
+        win.webContents.send('settings-updated', result);
+      } catch {}
+    }
+  }
+
+  // Wire the settings store so external file changes (cloud sync) can
+  // also broadcast to renderer windows.
+  setSettingsBroadcaster(broadcastSettingsToAllWindows);
+
+  // Re-run startup side effects when settings.json arrives from another
+  // Mac via cloud sync. Without this, synced hotkeys/extensions reach
+  // settings and the UI but the OS-level registrations never happen, so
+  // hotkeys do nothing and referenced extensions stay un-downloaded
+  // until the next app launch.
+  setExternalSettingsChangeHandler((reloaded) => {
+    try {
+      const nextShortcut = reloaded.globalShortcut || '';
+      if (nextShortcut && nextShortcut !== currentShortcut) {
+        registerGlobalShortcut(nextShortcut);
+      }
+    } catch (e) {
+      console.warn('[settings-sync] global shortcut re-register failed:', e);
+    }
+    try {
+      registerCommandHotkeys(reloaded.commandHotkeys || {});
+    } catch (e) {
+      console.warn('[settings-sync] command hotkeys re-register failed:', e);
+    }
+    void autoInstallMissingExtensions();
+  });
+
+  startSettingsWatcher();
+
+  // Reconcile filesystem extensions vs the synced installedExtensions list,
+  // and install anything missing in the background. Also re-runs whenever
+  // an external sync writes settings.json (see setExternalSettingsChangeHandler).
+  void autoInstallMissingExtensions();
+
   ipcMain.handle(
     'save-settings',
     async (_event: any, patch: Partial<AppSettings>) => {
       const result = saveSettings(patch);
-      const windowsToNotify = [mainWindow, settingsWindow, extensionStoreWindow, promptWindow]
-        .filter(Boolean) as Array<InstanceType<typeof BrowserWindow>>;
-      for (const win of windowsToNotify) {
-        if (win.isDestroyed()) continue;
-        try {
-          win.webContents.send('settings-updated', result);
-        } catch {}
-      }
+      broadcastSettingsToAllWindows(result);
       if (patch.uiStyle !== undefined) {
         const nextStyle = String(result.uiStyle || 'default').trim().toLowerCase();
         const shouldEnableGlassy = nextStyle === 'glassy';
@@ -14556,6 +14774,9 @@ return appURL's |path|() as text`,
       // Invalidate command cache so new extensions appear in the launcher
       invalidateCache();
       broadcastExtensionsUpdated();
+      // Record the install in synced settings so the user's other Macs
+      // auto-install on their next launch.
+      addInstalledExtensionToSettings(name);
       return true;
     }
   );
@@ -14572,6 +14793,9 @@ return appURL's |path|() as text`,
         // extension before its bundle keeps trying to re-mount itself.
         broadcastExtensionUninstalled(name);
         broadcastExtensionsUpdated();
+        // Record the uninstall in synced settings so other Macs don't
+        // re-install it on their next launch.
+        removeInstalledExtensionFromSettings(name);
       }
       return success;
     }
@@ -16709,6 +16933,63 @@ if let tiff = image?.tiffRepresentation {
     } finally {
       suppressBlurHide = false;
     }
+  });
+
+  // ─── IPC: Settings Folder Location ──────────────────────────────
+
+  ipcMain.handle('get-settings-location', () => {
+    return {
+      path: loadSettingsLocation(),
+      defaultPath: getDefaultSettingsPath(),
+    };
+  });
+
+  ipcMain.handle('pick-settings-folder', async (event: any) => {
+    suppressBlurHide = true;
+    try {
+      const result = await dialog.showOpenDialog(getDialogParentWindow(event), {
+        properties: ['openDirectory', 'createDirectory', 'dontAddToRecent'],
+        buttonLabel: 'Choose',
+        message: 'Choose a folder to store SuperCmd settings',
+        defaultPath: app.getPath('home'),
+      });
+      if (result.canceled) return null;
+      const selectedPath = String(result.filePaths?.[0] || '').trim();
+      if (!selectedPath) return null;
+      const candidate = path.join(selectedPath, 'settings.json');
+      let hasExisting = false;
+      try {
+        hasExisting = settingsFileExistsOrICloudPlaceholder(candidate);
+      } catch {
+        hasExisting = false;
+      }
+      return { path: selectedPath, hasExisting };
+    } catch (error: any) {
+      console.error('pick-settings-folder failed:', error);
+      return null;
+    } finally {
+      suppressBlurHide = false;
+    }
+  });
+
+  ipcMain.handle(
+    'relocate-settings',
+    async (_event: any, args: { targetDir: string; mode: RelocateMode }) => {
+      const mode: RelocateMode = args?.mode === 'adopt' || args?.mode === 'replace' ? args.mode : 'move';
+      const result = relocateSettingsFile(String(args?.targetDir || ''), mode);
+      if (result.ok && result.settings) {
+        broadcastSettingsToAllWindows(result.settings);
+      }
+      return result;
+    }
+  );
+
+  ipcMain.handle('reset-settings-location', async () => {
+    const result = resetSettingsLocation();
+    if (result.ok && result.settings) {
+      broadcastSettingsToAllWindows(result.settings);
+    }
+    return result;
   });
 
   // ─── IPC: Menu Bar (Tray) Extensions ────────────────────────────
