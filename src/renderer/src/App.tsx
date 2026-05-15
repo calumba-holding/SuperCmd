@@ -385,7 +385,7 @@ const App: React.FC = () => {
   const [fileSearchInitialDetailPath, setFileSearchInitialDetailPath] = useState<string | null>(null);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [navigationStyle, setNavigationStyle] = useState<'vim' | 'macos'>('vim');
-  const [isLoading, setIsLoading] = useState(true);
+  const [isLoading, setIsLoading] = useState(false);
   const homeDir = String((window.electron as any).homeDir || '');
   const {
     extensionView, extensionPreferenceSetup, scriptCommandSetup, scriptCommandOutput,
@@ -802,7 +802,7 @@ const App: React.FC = () => {
   // Mount-only initial load — must NOT re-run when callbacks are recreated
   // or the loading flash triggers on every aiStreaming state change.
   useEffect(() => {
-    fetchCommands();
+    fetchCommands({ showLoading: false });
     loadLauncherPreferences();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -1710,11 +1710,11 @@ const App: React.FC = () => {
     () => new Set(['system-add-to-memory', 'system-cursor-prompt', 'system-emoji-picker']),
     []
   );
-  const visibleSourceCommands = useMemo(
-    () => sourceCommands.filter((cmd) => !hiddenListOnlyCommandIds.has(cmd.id)),
-    [sourceCommands, hiddenListOnlyCommandIds]
-  );
   const hasSearchQuery = searchQuery.trim().length > 0;
+  const visibleSourceCommands = useMemo(
+    () => sourceCommands.filter((cmd) => !hiddenListOnlyCommandIds.has(cmd.id) || hasSearchQuery),
+    [sourceCommands, hiddenListOnlyCommandIds, hasSearchQuery]
+  );
 
   const fileResultCommands = useMemo<CommandInfo[]>(
     () =>

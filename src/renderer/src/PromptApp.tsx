@@ -138,6 +138,10 @@ const PromptApp: React.FC = () => {
   }, []);
 
   useEffect(() => {
+    window.electron.rendererReady();
+  }, []);
+
+  useEffect(() => {
     const cleanupWindowShown = window.electron.onWindowShown((payload) => {
       if (payload?.mode !== 'prompt') return;
       selectedTextSnapshotRef.current = String(payload?.selectedTextSnapshot || '');
@@ -237,7 +241,7 @@ const PromptApp: React.FC = () => {
             }}
             placeholder="Tell AI what to do with selected text..."
             ref={textareaRef}
-            className="cursor-prompt-textarea w-full bg-transparent border-none outline-none text-white/95 text-[13px] font-medium tracking-[0.003em]"
+            className="cursor-prompt-textarea w-full bg-transparent border-none outline-none text-[13px] font-medium tracking-[0.003em]"
             autoFocus
           />
         </div>
