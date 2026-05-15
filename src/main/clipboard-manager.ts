@@ -838,7 +838,7 @@ export function startClipboardMonitor(): void {
       lastPasteboardChangeCount = addon.getPasteboardChangeCount();
     }
   } catch {}
-  
+
   // Start polling
   if (pollInterval) {
     clearInterval(pollInterval);
