@@ -2593,6 +2593,7 @@ type AppUpdaterState =
   | 'not-available'
   | 'downloading'
   | 'downloaded'
+  | 'restarting'
   | 'error';
 type AppUpdaterStatusSnapshot = {
   state: AppUpdaterState;
@@ -2611,7 +2612,9 @@ let appUpdaterConfigured = false;
 let appUpdater: any | null = null;
 let appUpdaterCheckPromise: Promise<void> | null = null;
 let appUpdaterDownloadPromise: Promise<void> | null = null;
+let appUpdaterRestartPromise: Promise<boolean> | null = null;
 const APP_UPDATER_AUTO_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const APP_UPDATER_RESTART_TIMEOUT_MS = 15_000;
 // Version string set when a background auto-check silently downloads an update.
 // null means no auto-downloaded update is ready (user must use manual flow).
 let autoUpdateDownloadedVersion: string | null = null;
@@ -10292,8 +10295,11 @@ async function runCommandById(commandId: string, source: 'launcher' | 'hotkey' |
       return false;
     }
     void showMemoryStatusBar('processing', 'Restarting to install update...');
-    restartAndInstallAppUpdate();
-    return true;
+    const installed = await restartAndInstallAppUpdate();
+    if (!installed) {
+      void showMemoryStatusBar('error', 'Failed to restart for update installation.');
+    }
+    return installed;
   }
 
   if (commandId === 'system-check-for-updates') {
@@ -10326,7 +10332,7 @@ async function runCommandById(commandId: string, source: 'launcher' | 'hotkey' |
       }
       if (appUpdaterStatusSnapshot.state === 'downloaded') {
         void showMemoryStatusBar('processing', 'Restarting to install update...');
-        const installed = restartAndInstallAppUpdate();
+        const installed = await restartAndInstallAppUpdate();
         if (installed) {
           return true;
         }
@@ -11797,11 +11803,18 @@ function stopInstalledAppsWatchers(): void {
 }
 
 function updateAppUpdaterStatus(patch: Partial<AppUpdaterStatusSnapshot>): void {
+  const previousState = appUpdaterStatusSnapshot.state;
   appUpdaterStatusSnapshot = {
     ...appUpdaterStatusSnapshot,
     ...patch,
   };
   sendAppUpdaterStatusToRenderers();
+  if (
+    previousState !== appUpdaterStatusSnapshot.state &&
+    (previousState === 'downloaded' || appUpdaterStatusSnapshot.state === 'downloaded')
+  ) {
+    broadcastCommandsUpdated();
+  }
 }
 
 function parseGithubRepository(input: string): { owner: string; repo: string } | null {
@@ -12084,8 +12097,12 @@ async function runBackgroundAppUpdaterCheck(): Promise<void> {
 }
 
 function isUpdateBannerDismissed(): boolean {
-  const dismissedAt = Number((loadSettings() as any).updateBannerDismissedAt || 0);
+  const settings = loadSettings() as any;
+  const dismissedAt = Number(settings.updateBannerDismissedAt || 0);
   if (!dismissedAt) return false;
+  const dismissedVersion = String(settings.updateBannerDismissedVersion || '').trim();
+  const readyVersion = String(appUpdaterStatusSnapshot.latestVersion || autoUpdateDownloadedVersion || '').trim();
+  if (readyVersion && dismissedVersion !== readyVersion) return false;
   return Date.now() - dismissedAt < 3 * 24 * 60 * 60 * 1000;
 }
 
@@ -12121,6 +12138,12 @@ async function downloadAppUpdate(): Promise<AppUpdaterStatusSnapshot> {
         supported: true,
         message: 'Downloading update...',
       });
+      if (process.platform === 'darwin') {
+        try {
+          appUpdater.autoInstallOnAppQuit = true;
+          appUpdater.autoRunAppAfterInstall = true;
+        } catch {}
+      }
       await appUpdater.downloadUpdate();
     })
     .catch((error: any) => {
@@ -12138,21 +12161,95 @@ async function downloadAppUpdate(): Promise<AppUpdaterStatusSnapshot> {
   return { ...appUpdaterStatusSnapshot };
 }
 
-function restartAndInstallAppUpdate(): boolean {
+async function restartAndInstallAppUpdate(): Promise<boolean> {
   ensureAppUpdaterConfigured();
   if (!appUpdater) return false;
+  if (appUpdaterRestartPromise) return appUpdaterRestartPromise;
   if (appUpdaterStatusSnapshot.state !== 'downloaded') return false;
-  try {
-    setTimeout(() => {
+
+  appUpdaterRestartPromise = new Promise<boolean>((resolve) => {
+    let settled = false;
+    let triggerTimer: NodeJS.Timeout | null = null;
+    let timeoutTimer: NodeJS.Timeout | null = null;
+
+    const cleanup = () => {
+      if (triggerTimer) {
+        clearTimeout(triggerTimer);
+        triggerTimer = null;
+      }
+      if (timeoutTimer) {
+        clearTimeout(timeoutTimer);
+        timeoutTimer = null;
+      }
       try {
-        appUpdater.quitAndInstall(false, true);
+        app.removeListener('before-quit', markStarted);
       } catch {}
-    }, 40);
-    return true;
-  } catch (error) {
-    console.warn('[Updater] Failed to quit and install update:', error);
-    return false;
-  }
+      try {
+        electron.autoUpdater?.removeListener?.('before-quit-for-update', markStarted);
+      } catch {}
+    };
+
+    const finish = (ok: boolean, error?: any) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (!ok) {
+        isAppQuitting = false;
+        const message = String(error?.message || error || 'Failed to restart for update installation.');
+        console.warn('[Updater] Failed to restart for update installation:', message);
+        updateAppUpdaterStatus({
+          state: 'downloaded',
+          supported: true,
+          message,
+        });
+      }
+      resolve(ok);
+    };
+
+    function markStarted() {
+      finish(true);
+    }
+
+    try {
+      app.once('before-quit', markStarted);
+      electron.autoUpdater?.once?.('before-quit-for-update', markStarted);
+
+      // electron-updater's update quit path closes windows before Electron emits
+      // app.before-quit. The launcher is normally not closable, so prepare it here
+      // or quitAndInstall can silently fail to close the app.
+      prepareWindowsForAppQuit();
+      updateAppUpdaterStatus({
+        state: 'restarting',
+        message: 'Restarting to install update...',
+      });
+
+      triggerTimer = setTimeout(() => {
+        try {
+          if (process.platform === 'darwin') {
+            try {
+              appUpdater.autoInstallOnAppQuit = true;
+              appUpdater.autoRunAppAfterInstall = true;
+            } catch {}
+            appUpdater.quitAndInstall();
+          } else {
+            appUpdater.quitAndInstall(false, true);
+          }
+        } catch (error: any) {
+          finish(false, error);
+        }
+      }, 40);
+
+      timeoutTimer = setTimeout(() => {
+        finish(false, 'Restart did not start. Please try Update and Restart again.');
+      }, APP_UPDATER_RESTART_TIMEOUT_MS);
+    } catch (error: any) {
+      finish(false, error);
+    }
+  }).finally(() => {
+    appUpdaterRestartPromise = null;
+  });
+
+  return appUpdaterRestartPromise;
 }
 
 // ─── Shortcut Management ────────────────────────────────────────────
@@ -12656,7 +12753,7 @@ app.whenReady().then(async () => {
       ).toString('base64')}`;
       filtered.unshift({
         id: 'system-update-and-reopen',
-        title: 'Update and Reopen',
+        title: 'Update and Restart',
         subtitle: `Version ${version} downloaded and ready to install`,
         keywords: ['update', 'reopen', 'restart', 'install', 'version', version],
         category: 'system',
@@ -12669,7 +12766,11 @@ app.whenReady().then(async () => {
   });
 
   ipcMain.handle('dismiss-update-banner', () => {
-    saveSettings({ updateBannerDismissedAt: Date.now() } as any);
+    saveSettings({
+      updateBannerDismissedAt: Date.now(),
+      updateBannerDismissedVersion: appUpdaterStatusSnapshot.latestVersion || autoUpdateDownloadedVersion || '',
+    } as any);
+    broadcastCommandsUpdated();
   });
 
   ipcMain.handle(
@@ -13164,8 +13265,8 @@ app.whenReady().then(async () => {
     return await downloadAppUpdate();
   });
 
-  ipcMain.handle('app-updater-quit-and-install', () => {
-    return restartAndInstallAppUpdate();
+  ipcMain.handle('app-updater-quit-and-install', async () => {
+    return await restartAndInstallAppUpdate();
   });
 
   // Full update flow: check → download → restart
@@ -13202,7 +13303,7 @@ app.whenReady().then(async () => {
       // Step 3: Restart if downloaded
       if (appUpdaterStatusSnapshot.state === 'downloaded') {
         void showMemoryStatusBar('processing', 'Restarting to install update...');
-        const installed = restartAndInstallAppUpdate();
+        const installed = await restartAndInstallAppUpdate();
         if (installed) {
           return { success: true, message: 'Restarting to install update...', state: 'restarting' };
         }
