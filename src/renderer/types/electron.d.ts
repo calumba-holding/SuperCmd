@@ -667,6 +667,7 @@ export interface AppSettings {
   emojiPickerExcludedAppBundleIds: string[];
   browserSearch: BrowserSearchSettings;
   rootSearchRanking: Record<string, RootSearchRankingSetting>;
+  rootSearchAutocompleteEnabled: boolean;
   popToRootSearchTimeoutSeconds: number;
   installedExtensions: string[];
   extensionUninstallTombstones: Record<string, number>;
@@ -698,6 +699,7 @@ export interface ClipboardItem {
   preview?: string;
   timestamp: number;
   pinned?: boolean;
+  pinnedOrder?: number;
   source?: string;
   metadata?: {
     width?: number;
@@ -1066,7 +1068,7 @@ export interface ElectronAPI {
   getDefaultApplication: (filePath: string) => Promise<{ name: string; path: string; bundleId?: string }>;
   getFrontmostApplication: () => Promise<{ name: string; path: string; bundleId?: string } | null>;
   runAppleScript: (script: string, options?: { language?: string; humanReadableOutput?: boolean; timeout?: number }) => Promise<string>;
-  getAppMenuItems: () => Promise<{ ok: boolean; items?: Array<{ path: string; title: string; fullPath: string; shortcut?: string | null; enabled: boolean }>; error?: string }>;
+  getAppMenuItems: () => Promise<{ ok: boolean; items?: Array<{ path: string; title: string; fullPath: string; shortcut?: string | null; enabled: boolean }>; error?: string; appName?: string; appIconDataUrl?: string | null }>;
   pressAppMenuItem: (path: string) => Promise<{ ok: boolean; error?: string }>;
   ensureCalendarAccess: (options?: { prompt?: boolean }) => Promise<CalendarPermissionResult>;
   getCalendarEvents: (payload: { start: string; end: string }) => Promise<CalendarEventsResult>;
@@ -1107,6 +1109,7 @@ export interface ElectronAPI {
   clipboardCopyItem: (id: string) => Promise<boolean>;
   clipboardPasteItem: (id: string) => Promise<boolean>;
   clipboardTogglePin: (id: string) => Promise<ClipboardItem | null>;
+  clipboardMovePinned: (id: string, direction: 'up' | 'down') => Promise<boolean>;
   clipboardSaveAsSnippet: (id: string) => Promise<Snippet | null>;
   clipboardSaveAsFile: (id: string) => Promise<boolean>;
   clipboardSetEnabled: (enabled: boolean) => Promise<void>;
