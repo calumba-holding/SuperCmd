@@ -706,9 +706,9 @@
         "label": "Enable debug mode"
       },
       "browserSearch": {
-        "title": "Browser Profiles",
-        "description": "Connect browser profiles so SuperCmd can use their local history and keep it refreshed.",
-        "enableLabel": "Use browser profiles in SuperCmd",
+        "title": "Browser Search",
+        "description": "Press Enter on a query to open it in your default browser. Inline autocomplete suggests sites from your history.",
+        "enableLabel": "Enable browser search",
         "alphaToggle": {
           "label": "Use alpha Chromium root search",
           "description": "Show profile history, bookmarks, and open tabs in root search. Turn this on only for Chromium profiles while the browser extension is still in alpha."

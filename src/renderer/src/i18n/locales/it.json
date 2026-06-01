@@ -706,9 +706,9 @@
         "label": "Abilita modalità debug"
       },
       "browserSearch": {
-        "title": "Profili browser",
-        "description": "Collega profili browser così SuperCmd può usare la loro cronologia locale e mantenerla aggiornata.",
-        "enableLabel": "Usa profili browser in SuperCmd",
+        "title": "Ricerca nel browser",
+        "description": "Premi Invio su una query per aprirla nel tuo browser predefinito. L’autocompletamento inline suggerisce siti dalla tua cronologia.",
+        "enableLabel": "Abilita ricerca nel browser",
         "alphaToggle": {
           "label": "Usa la ricerca root Chromium alfa",
           "description": "Mostra cronologia dei profili, segnalibri e schede aperte nella ricerca root. Attivala solo per profili Chromium mentre l'estensione browser e ancora in alfa."
