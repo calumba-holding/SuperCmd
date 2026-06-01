@@ -706,9 +706,9 @@
         "label": "启用调试模式"
       },
       "browserSearch": {
-        "title": "浏览器个人资料",
-        "description": "连接浏览器个人资料，让 SuperCmd 使用其本地历史记录并持续刷新。",
-        "enableLabel": "在 SuperCmd 中使用浏览器个人资料",
+        "title": "浏览器搜索",
+        "description": "在查询时按 Enter，即可在默认浏览器中打开。内联自动补全会根据你的历史记录推荐网站。",
+        "enableLabel": "启用浏览器搜索",
         "alphaToggle": {
           "label": "使用 Alpha 版 Chromium 根搜索",
           "description": "在根搜索中显示个人资料历史记录、书签和打开的标签页。浏览器扩展仍处于 Alpha 阶段时，仅建议为 Chromium 个人资料开启。"

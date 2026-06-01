@@ -706,9 +706,9 @@
         "label": "Enable debug mode"
       },
       "browserSearch": {
-        "title": "Profils de navigateur",
-        "description": "Connectez des profils de navigateur pour que SuperCmd utilise leur historique local et le garde à jour.",
-        "enableLabel": "Utiliser les profils de navigateur dans SuperCmd",
+        "title": "Recherche navigateur",
+        "description": "Appuyez sur Entrée sur une requête pour l’ouvrir dans votre navigateur par défaut. L’autocomplétion en ligne suggère des sites depuis votre historique.",
+        "enableLabel": "Activer la recherche navigateur",
         "alphaToggle": {
           "label": "Utiliser la recherche racine Chromium alpha",
           "description": "Affiche l'historique des profils, les favoris et les onglets ouverts dans la recherche racine. Activez ceci uniquement pour les profils Chromium tant que l'extension de navigateur est en alpha."

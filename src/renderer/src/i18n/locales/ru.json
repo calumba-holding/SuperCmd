@@ -706,9 +706,9 @@
         "label": "Включить режим отладки"
       },
       "browserSearch": {
-        "title": "Профили браузера",
-        "description": "Подключите профили браузера, чтобы SuperCmd использовал их локальную историю и поддерживал ее актуальной.",
-        "enableLabel": "Использовать профили браузера в SuperCmd",
+        "title": "Поиск в браузере",
+        "description": "Нажмите Enter на запросе, чтобы открыть его в браузере по умолчанию. Встроенное автозаполнение предлагает сайты из вашей истории.",
+        "enableLabel": "Включить поиск в браузере",
         "alphaToggle": {
           "label": "Use alpha Chromium root search",
           "description": "Show profile history, bookmarks, and open tabs in root search. Turn this on only for Chromium profiles while the browser extension is still in alpha."
