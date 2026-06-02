@@ -2479,6 +2479,7 @@ let promptRendererReady = false;
 let pendingPromptWindowShown: { mode: string; selectedTextSnapshot: string } | null = null;
 let memoryStatusWindow: InstanceType<typeof BrowserWindow> | null = null;
 let memoryStatusHideTimer: NodeJS.Timeout | null = null;
+let memoryStatusFadeFinalizeTimer: NodeJS.Timeout | null = null;
 let memoryStatusRenderSeq = 0;
 let memoryStatusHideTimerSeq = 0;
 let confettiWindow: InstanceType<typeof BrowserWindow> | null = null;
@@ -2680,7 +2681,16 @@ function hideMemoryStatusBar(): void {
       win.webContents.executeJavaScript('window.__scFadeOut && window.__scFadeOut()').catch(() => {});
     }
   } catch {}
-  setTimeout(() => {
+  // Track the fade-out finalization timeout so a fresh showMemoryStatusBar
+  // arriving during the 200 ms fade can cancel it. Without this, the
+  // win.hide() below fires unconditionally and yanks the freshly-shown
+  // badge off-screen ~200 ms after the new show — making rapid
+  // processing → success transitions appear to flash for only a moment.
+  if (memoryStatusFadeFinalizeTimer) clearTimeout(memoryStatusFadeFinalizeTimer);
+  const finalizeSeq = memoryStatusRenderSeq;
+  memoryStatusFadeFinalizeTimer = setTimeout(() => {
+    memoryStatusFadeFinalizeTimer = null;
+    if (finalizeSeq !== memoryStatusRenderSeq) return;
     if (!win.isDestroyed()) {
       try { win.hide(); } catch {}
     }
@@ -3299,6 +3309,8 @@ const WINDOW_MANAGEMENT_PRESET_COMMAND_IDS = new Set<string>([
   'system-window-management-center',
   'system-window-management-center-80',
   'system-window-management-fill',
+  'system-window-management-maximize-width',
+  'system-window-management-maximize-height',
   'system-window-management-top-left',
   'system-window-management-top-right',
   'system-window-management-bottom-left',
@@ -3362,6 +3374,8 @@ const WINDOW_MANAGEMENT_LAYOUT_COMMAND_IDS = new Set<string>([
   'system-window-management-center',
   'system-window-management-center-80',
   'system-window-management-fill',
+  'system-window-management-maximize-width',
+  'system-window-management-maximize-height',
   'system-window-management-top-left',
   'system-window-management-top-right',
   'system-window-management-bottom-left',
@@ -3870,7 +3884,8 @@ function sortNodeWindowsForLayout(windows: NodeWindowInfo[]): NodeWindowInfo[] {
 
 function computeWindowManagementLayoutBounds(
   commandId: string,
-  area: { x: number; y: number; width: number; height: number }
+  area: { x: number; y: number; width: number; height: number },
+  windowBounds?: NodeWindowBounds | null
 ): NodeWindowBounds | null {
   const normalized = String(commandId || '').trim();
   const halfWidthLeft = Math.max(1, Math.floor(area.width / 2));
@@ -3926,6 +3941,36 @@ function computeWindowManagementLayoutBounds(
         width: area.width,
         height: area.height,
       };
+    case 'system-window-management-maximize-width': {
+      // Span the full work-area width, keep the current vertical position/height.
+      if (!windowBounds) return null;
+      const height = clampWindowManagementFineTuneValue(
+        Math.round(windowBounds.height),
+        WINDOW_MANAGEMENT_FINE_TUNE_MIN_HEIGHT,
+        area.height
+      );
+      const y = clampWindowManagementFineTuneValue(
+        Math.round(windowBounds.y),
+        area.y,
+        areaBottom - height
+      );
+      return { x: area.x, y, width: area.width, height };
+    }
+    case 'system-window-management-maximize-height': {
+      // Span the full work-area height, keep the current horizontal position/width.
+      if (!windowBounds) return null;
+      const width = clampWindowManagementFineTuneValue(
+        Math.round(windowBounds.width),
+        WINDOW_MANAGEMENT_FINE_TUNE_MIN_WIDTH,
+        area.width
+      );
+      const x = clampWindowManagementFineTuneValue(
+        Math.round(windowBounds.x),
+        area.x,
+        areaRight - width
+      );
+      return { x, y: area.y, width, height: area.height };
+    }
     case 'system-window-management-center': {
       const width = clampWindowManagementFineTuneValue(
         Math.round(area.width * 0.6),
@@ -4350,7 +4395,7 @@ async function executeWindowManagementLayoutCommand(
       return await queueWindowMutations(entries);
     }
 
-    const next = computeWindowManagementLayoutBounds(normalized, area);
+    const next = computeWindowManagementLayoutBounds(normalized, area, target.bounds);
     if (!next) return false;
     return await queueWindowMutations([
       {
@@ -8914,7 +8959,28 @@ async function showWindow(options?: { systemCommandId?: string }): Promise<void>
     } catch {}
   }
 
-  const shouldActivateLauncherWindow = process.platform !== 'darwin' || launcherMode === 'onboarding';
+  // When a sibling window from our own app (Settings, Extension Store, Notes,
+  // Canvas, etc.) is currently the key window, the launcher panel's
+  // mainWindow.focus() alone is not enough to take key status away from a
+  // regular activated window in the same app — so the search input never
+  // actually receives keystrokes. Detect that case and fully activate the
+  // launcher window via app.focus({ steal: true }). This only steals focus
+  // from our own sibling window, not from another app, so the selection
+  // snapshot behavior (which only matters when another app is frontmost)
+  // is unaffected.
+  const ownAppSiblingWindowFocused =
+    process.platform === 'darwin' &&
+    BrowserWindow.getAllWindows().some(
+      (win: InstanceType<typeof BrowserWindow>) =>
+        win !== mainWindow &&
+        !win.isDestroyed() &&
+        win.isVisible() &&
+        win.isFocused()
+    );
+  const shouldActivateLauncherWindow =
+    process.platform !== 'darwin' ||
+    launcherMode === 'onboarding' ||
+    ownAppSiblingWindowFocused;
   let selectionSnapshotPromise: Promise<string> | null = null;
 
   // Capture the frontmost app BEFORE showing our window.
