@@ -215,6 +215,7 @@ export interface AppSettings {
   openAtLogin: boolean;
   disabledCommands: string[];
   enabledCommands: string[];
+  searchApplicationsScope: string[];
   customExtensionFolders: string[];
   scriptCommandFolders: string[];
   commandHotkeys: Record<string, string>;
@@ -330,6 +331,14 @@ const DEFAULT_SETTINGS: AppSettings = {
   openAtLogin: false,
   disabledCommands: [],
   enabledCommands: [],
+  searchApplicationsScope: [
+    '/Applications',
+    '/Applications/Utilities',
+    '/System/Applications',
+    '/System/Applications/Utilities',
+    '/System/Library/CoreServices/Applications',
+    path.join(process.env.HOME || '', 'Applications')
+  ],
   customExtensionFolders: [],
   scriptCommandFolders: [],
   commandHotkeys: {
@@ -1227,6 +1236,9 @@ export function loadSettings(): AppSettings {
       openAtLogin: parsed.openAtLogin ?? DEFAULT_SETTINGS.openAtLogin,
       disabledCommands: parsed.disabledCommands ?? DEFAULT_SETTINGS.disabledCommands,
       enabledCommands: parsed.enabledCommands ?? DEFAULT_SETTINGS.enabledCommands,
+      searchApplicationsScope: Array.isArray(parsed.searchApplicationsScope) && parsed.searchApplicationsScope.length > 0
+        ? parsed.searchApplicationsScope
+        : DEFAULT_SETTINGS.searchApplicationsScope,
       customExtensionFolders: Array.isArray(parsed.customExtensionFolders)
         ? parsed.customExtensionFolders
             .map((value: any) => String(value || '').trim())
@@ -2236,6 +2248,14 @@ export function loadNotesWindowState(): NotesWindowState | null {
     notesWindowStateCache = null;
   }
   return notesWindowStateCache;
+}
+
+export function getSearchApplicationsScope(): string[] {
+  const settings = loadSettings();
+  const appDirs: string[] = settings.searchApplicationsScope || [];
+  return appDirs
+    .filter((dir) => Boolean(dir))
+    .filter((dir, idx, all) => all.indexOf(dir) === idx);
 }
 
 export function saveNotesWindowState(state: NotesWindowState): void {
